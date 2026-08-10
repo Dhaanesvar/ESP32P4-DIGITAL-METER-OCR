@@ -1,0 +1,449 @@
+From a01258c76cce9800a2dc7fc36914c3afac60eb20 Mon Sep 17 00:00:00 2001
+From: lvhaiyu <lvhaiyu@espressif.com>
+Date: Tue, 10 Feb 2026 19:57:40 +0800
+Subject: [PATCH] feat(sdmmc): Accelerate SD card read/write speed
+
+---
+ components/sdmmc/include/sdmmc_cmd.h |  28 +++
+ components/sdmmc/sdmmc_cmd.c         | 348 +++++++++++++++++++++++----
+ 2 files changed, 326 insertions(+), 50 deletions(-)
+
+diff --git a/components/sdmmc/include/sdmmc_cmd.h b/components/sdmmc/include/sdmmc_cmd.h
+index 07148042daa..573a9f510ef 100644
+--- a/components/sdmmc/include/sdmmc_cmd.h
++++ b/components/sdmmc/include/sdmmc_cmd.h
+@@ -49,6 +49,34 @@ void sdmmc_card_print_info(FILE* stream, const sdmmc_card_t* card);
+  */
+ esp_err_t sdmmc_get_status(sdmmc_card_t* card);
+ 
++/**
++ * Initialize SDMMC cache buffers for optimized read/write operations
++ *
++ * This function pre-allocates internal DMA-aligned cache buffers that are used
++ * when the user-provided buffers are not suitable for DMA operations.
++ * Calling this function is optional - the cache will be initialized automatically
++ * on first use. However, pre-initialization can help avoid allocation delays
++ * during I/O operations.
++ *
++ * @note The cache buffers are protected by mutexes for thread safety.
++ *
++ * @return
++ *      - ESP_OK on success
++ *      - ESP_ERR_NO_MEM if memory allocation fails
++ */
++esp_err_t sdmmc_cache_init(void);
++
++/**
++ * Deinitialize and free SDMMC cache buffers
++ *
++ * This function releases the memory used by internal cache buffers.
++ * Call this when SDMMC operations are no longer needed to reclaim memory.
++ *
++ * @note This function is thread-safe and will wait for any ongoing operations
++ *       to complete before freeing resources.
++ */
++void sdmmc_cache_deinit(void);
++
+ /**
+  * Write given number of sectors to SD/MMC card
+  *
+diff --git a/components/sdmmc/sdmmc_cmd.c b/components/sdmmc/sdmmc_cmd.c
+index a928dee6d2e..c795dbdb308 100644
+--- a/components/sdmmc/sdmmc_cmd.c
++++ b/components/sdmmc/sdmmc_cmd.c
+@@ -5,10 +5,187 @@
+  */
+ 
+ #include <inttypes.h>
++#include <string.h>
+ #include "esp_private/sdmmc_common.h"
++#include "freertos/semphr.h"
++#include "esp_dma_utils.h"
+ 
+ static const char* TAG = "sdmmc_cmd";
+ 
++// Default cache buffer size (16KB)
++#define SDMMC_CACHE_BUFFER_DEFAULT_SIZE  (16 * 1024)
++
++// Cache buffer structure for thread-safe operations
++typedef struct {
++    char *buffer;
++    size_t size;
++    size_t allocated_size;
++    SemaphoreHandle_t mutex;
++    bool initialized;
++} sdmmc_cache_buffer_t;
++
++// Static cache buffers for read/write operations
++static sdmmc_cache_buffer_t s_write_cache = {
++    .buffer = NULL,
++    .size = 0,
++    .allocated_size = 0,
++    .mutex = NULL,
++    .initialized = false
++};
++
++static sdmmc_cache_buffer_t s_read_cache = {
++    .buffer = NULL,
++    .size = 0,
++    .allocated_size = 0,
++    .mutex = NULL,
++    .initialized = false
++};
++
++/**
++ * @brief Initialize a cache buffer with mutex protection
++ * @param cache Pointer to cache buffer structure
++ * @param initial_size Initial buffer size to allocate
++ * @return ESP_OK on success, error code otherwise
++ */
++static esp_err_t sdmmc_cache_buffer_init(sdmmc_cache_buffer_t *cache, size_t initial_size)
++{
++    if (cache->initialized) {
++        return ESP_OK;
++    }
++
++    // Align size to 64 bytes for DMA requirements
++    size_t aligned_size = (initial_size + 63) & ~63;
++
++    cache->mutex = xSemaphoreCreateMutex();
++    if (cache->mutex == NULL) {
++        ESP_LOGE(TAG, "%s: failed to create mutex", __func__);
++        return ESP_ERR_NO_MEM;
++    }
++
++    cache->buffer = heap_caps_aligned_alloc(64, aligned_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
++    if (cache->buffer == NULL) {
++        // Fallback to SPIRAM if internal memory is not available
++        cache->buffer = heap_caps_aligned_alloc(64, aligned_size, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
++    }
++
++    if (cache->buffer == NULL) {
++        vSemaphoreDelete(cache->mutex);
++        cache->mutex = NULL;
++        ESP_LOGE(TAG, "%s: failed to allocate cache buffer", __func__);
++        return ESP_ERR_NO_MEM;
++    }
++
++    cache->size = initial_size;
++    cache->allocated_size = aligned_size;
++    cache->initialized = true;
++
++    return ESP_OK;
++}
++
++/**
++ * @brief Ensure cache buffer is large enough, resize if needed
++ * @param cache Pointer to cache buffer structure
++ * @param required_size Required buffer size
++ * @return ESP_OK on success, error code otherwise
++ * @note Caller must hold the mutex
++ */
++static esp_err_t sdmmc_cache_buffer_ensure_size(sdmmc_cache_buffer_t *cache, size_t required_size)
++{
++    // Align size to 64 bytes for DMA requirements
++    size_t aligned_size = (required_size + 63) & ~63;
++
++    if (cache->allocated_size >= aligned_size) {
++        cache->size = required_size;
++        return ESP_OK;
++    }
++
++    // Free old buffer
++    char *old_buffer = cache->buffer;
++
++    // Allocate new buffer with aligned size (try internal memory first)
++    cache->buffer = heap_caps_aligned_alloc(64, aligned_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
++    if (cache->buffer == NULL) {
++        // Fallback to SPIRAM
++        cache->buffer = heap_caps_aligned_alloc(64, aligned_size, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
++    }
++
++    if (cache->buffer == NULL) {
++        // Restore old buffer on failure
++        cache->buffer = old_buffer;
++        ESP_LOGE(TAG, "%s: failed to resize cache buffer to %zu bytes", __func__, aligned_size);
++        return ESP_ERR_NO_MEM;
++    }
++
++    // Free old buffer after successful allocation
++    free(old_buffer);
++    cache->size = required_size;
++    cache->allocated_size = aligned_size;
++
++    return ESP_OK;
++}
++
++/**
++ * @brief Deinitialize and free cache buffer resources
++ * @param cache Pointer to cache buffer structure
++ */
++static void sdmmc_cache_buffer_deinit(sdmmc_cache_buffer_t *cache)
++{
++    if (!cache->initialized) {
++        return;
++    }
++
++    if (cache->mutex != NULL) {
++        xSemaphoreTake(cache->mutex, portMAX_DELAY);
++    }
++
++    if (cache->buffer != NULL) {
++        free(cache->buffer);
++        cache->buffer = NULL;
++    }
++    cache->size = 0;
++    cache->allocated_size = 0;
++
++    if (cache->mutex != NULL) {
++        SemaphoreHandle_t mutex = cache->mutex;
++        cache->mutex = NULL;
++        xSemaphoreGive(mutex);
++        vSemaphoreDelete(mutex);
++    }
++
++    cache->initialized = false;
++}
++
++/**
++ * @brief Initialize SDMMC cache buffers for optimized read/write operations
++ * @return ESP_OK on success, error code otherwise
++ */
++esp_err_t sdmmc_cache_init(void)
++{
++    esp_err_t err;
++
++    err = sdmmc_cache_buffer_init(&s_write_cache, SDMMC_CACHE_BUFFER_DEFAULT_SIZE);
++    if (err != ESP_OK) {
++        return err;
++    }
++
++    err = sdmmc_cache_buffer_init(&s_read_cache, SDMMC_CACHE_BUFFER_DEFAULT_SIZE);
++    if (err != ESP_OK) {
++        sdmmc_cache_buffer_deinit(&s_write_cache);
++        return err;
++    }
++
++    return ESP_OK;
++}
++
++/**
++ * @brief Deinitialize and free SDMMC cache buffers
++ */
++void sdmmc_cache_deinit(void)
++{
++    sdmmc_cache_buffer_deinit(&s_write_cache);
++    sdmmc_cache_buffer_deinit(&s_read_cache);
++}
++
+ 
+ esp_err_t sdmmc_send_cmd(sdmmc_card_t* card, sdmmc_command_t* cmd)
+ {
+@@ -452,42 +629,75 @@ esp_err_t sdmmc_write_sectors(sdmmc_card_t* card, const void* src,
+ 
+     esp_err_t err = ESP_OK;
+     size_t block_size = card->csd.sector_size;
+-    bool is_aligned = card->host.check_buffer_alignment(card->host.slot, src, block_size * block_count);
++    size_t total_size = block_size * block_count;
++
++    // Get DMA memory info for alignment check
++    esp_dma_mem_info_t dma_mem_info = {0};
++    if (card->host.get_dma_info != NULL) {
++        card->host.get_dma_info(card->host.slot, &dma_mem_info);
++    }
+ 
+-    if (is_aligned
++    // Check if source buffer is already properly aligned for DMA
++    bool src_is_aligned = esp_dma_is_buffer_alignment_satisfied(src, total_size, dma_mem_info);
+         #if !SOC_SDMMC_PSRAM_DMA_CAPABLE
+-            && !esp_ptr_external_ram(src)
++        src_is_aligned = src_is_aligned && !esp_ptr_external_ram(src);
+         #endif
+-    ) {
+-        err = sdmmc_write_sectors_dma(card, src, start_block, block_count, block_size * block_count);
+-    } else {
+-        // SDMMC peripheral needs DMA-capable buffers. Split the write into
+-        // separate single block writes, if needed, and allocate a temporary
+-        // DMA-capable buffer.
+-        void *tmp_buf = NULL;
+-        size_t actual_size = 0;
+-        // We don't want to force the allocation into SPIRAM, the allocator
+-        // will decide based on the buffer size and memory availability.
+-        tmp_buf = heap_caps_malloc(block_size, MALLOC_CAP_DMA);
+-        if (!tmp_buf) {
+-            ESP_LOGE(TAG, "%s: not enough mem, err=0x%x", __func__, ESP_ERR_NO_MEM);
+-            return ESP_ERR_NO_MEM;
++
++    // Fast path: source buffer is already DMA-aligned, use it directly
++    if (src_is_aligned) {
++        return sdmmc_write_sectors_dma(card, src, start_block, block_count, total_size);
++    }
++
++    // Slow path: need to use cache buffer for unaligned source
++    // Initialize cache if not done yet
++    if (!s_write_cache.initialized) {
++        err = sdmmc_cache_buffer_init(&s_write_cache, SDMMC_CACHE_BUFFER_DEFAULT_SIZE);
++        if (err != ESP_OK) {
++            ESP_LOGE(TAG, "%s: failed to init write cache, err=0x%x", __func__, err);
++            return err;
+         }
+-        actual_size = heap_caps_get_allocated_size(tmp_buf);
++    }
++
++    // Acquire mutex for thread safety
++    if (xSemaphoreTake(s_write_cache.mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
++        ESP_LOGE(TAG, "%s: timeout waiting for write cache mutex", __func__);
++        return ESP_ERR_TIMEOUT;
++    }
++
++    // Ensure cache buffer is large enough
++    err = sdmmc_cache_buffer_ensure_size(&s_write_cache, total_size);
++    if (err != ESP_OK) {
++        xSemaphoreGive(s_write_cache.mutex);
++        return err;
++    }
+ 
+-        const uint8_t* cur_src = (const uint8_t*) src;
++    // Check if cache buffer is DMA-aligned
++    bool cache_is_aligned = esp_dma_is_buffer_alignment_satisfied(s_write_cache.buffer, total_size, dma_mem_info);
++    #if !SOC_SDMMC_PSRAM_DMA_CAPABLE
++        cache_is_aligned = cache_is_aligned && !esp_ptr_external_ram(s_write_cache.buffer);
++    #endif
++
++    if (cache_is_aligned) {
++        // Copy data to aligned cache buffer and write all blocks at once
++        memcpy(s_write_cache.buffer, src, total_size);
++        err = sdmmc_write_sectors_dma(card, s_write_cache.buffer, start_block, block_count, total_size);
++    } else {
++        // Fallback: write one block at a time using the cache buffer
++        // This can happen if cache was allocated in SPIRAM on non-PSRAM-DMA-capable chips
++        const uint8_t* cur_src = (const uint8_t*)src;
+         for (size_t i = 0; i < block_count; ++i) {
+-            memcpy(tmp_buf, cur_src, block_size);
++            memcpy(s_write_cache.buffer, cur_src, block_size);
+             cur_src += block_size;
+-            err = sdmmc_write_sectors_dma(card, tmp_buf, start_block + i, 1, actual_size);
++            err = sdmmc_write_sectors_dma(card, s_write_cache.buffer, start_block + i, 1, block_size);
+             if (err != ESP_OK) {
+-                ESP_LOGD(TAG, "%s: error 0x%x writing block %d+%d",
++                ESP_LOGD(TAG, "%s: error 0x%x writing block %zu+%zu",
+                         __func__, err, start_block, i);
+                 break;
+             }
+         }
+-        free(tmp_buf);
+     }
++
++    xSemaphoreGive(s_write_cache.mutex);
+     return err;
+ }
+ 
+@@ -590,40 +800,78 @@ esp_err_t sdmmc_read_sectors(sdmmc_card_t* card, void* dst,
+ 
+     esp_err_t err = ESP_OK;
+     size_t block_size = card->csd.sector_size;
+-    bool is_aligned = card->host.check_buffer_alignment(card->host.slot, dst, block_size * block_count);
++    size_t total_size = block_size * block_count;
+ 
+-    if (is_aligned
++    // Get DMA memory info for alignment check
++    esp_dma_mem_info_t dma_mem_info = {0};
++    if (card->host.get_dma_info != NULL) {
++        card->host.get_dma_info(card->host.slot, &dma_mem_info);
++    }
++
++    // Check if destination buffer is already properly aligned for DMA
++    bool dst_is_aligned = esp_dma_is_buffer_alignment_satisfied(dst, total_size, dma_mem_info);
+         #if !SOC_SDMMC_PSRAM_DMA_CAPABLE
+-            && !esp_ptr_external_ram(dst)
++        dst_is_aligned = dst_is_aligned && !esp_ptr_external_ram(dst);
+         #endif
+-    ) {
+-        err = sdmmc_read_sectors_dma(card, dst, start_block, block_count, block_size * block_count);
+-    } else {
+-        // SDMMC peripheral needs DMA-capable buffers. Split the read into
+-        // separate single block reads, if needed, and allocate a temporary
+-        // DMA-capable buffer.
+-        void *tmp_buf = NULL;
+-        size_t actual_size = 0;
+-        tmp_buf = heap_caps_malloc(block_size, MALLOC_CAP_DMA);
+-        if (!tmp_buf) {
+-            ESP_LOGE(TAG, "%s: not enough mem, err=0x%x", __func__, ESP_ERR_NO_MEM);
+-            return ESP_ERR_NO_MEM;
+-        }
+-        actual_size = heap_caps_get_allocated_size(tmp_buf);
+ 
+-        uint8_t* cur_dst = (uint8_t*) dst;
+-        for (size_t i = 0; i < block_count; ++i) {
+-            err = sdmmc_read_sectors_dma(card, tmp_buf, start_block + i, 1, actual_size);
+-            if (err != ESP_OK) {
+-                ESP_LOGD(TAG, "%s: error 0x%x writing block %d+%d",
+-                        __func__, err, start_block, i);
+-                break;
++    // Fast path: destination buffer is already DMA-aligned, use it directly
++    if (dst_is_aligned) {
++        return sdmmc_read_sectors_dma(card, dst, start_block, block_count, total_size);
++    }
++
++    // Slow path: need to use cache buffer for unaligned destination
++    // Initialize cache if not done yet
++    if (!s_read_cache.initialized) {
++        err = sdmmc_cache_buffer_init(&s_read_cache, SDMMC_CACHE_BUFFER_DEFAULT_SIZE);
++        if (err != ESP_OK) {
++            ESP_LOGE(TAG, "%s: failed to init read cache, err=0x%x", __func__, err);
++            return err;
+             }
+-            memcpy(cur_dst, tmp_buf, block_size);
+-            cur_dst += block_size;
+         }
+-        free(tmp_buf);
++
++    // Acquire mutex for thread safety
++    if (xSemaphoreTake(s_read_cache.mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
++        ESP_LOGE(TAG, "%s: timeout waiting for read cache mutex", __func__);
++        return ESP_ERR_TIMEOUT;
++            }
++
++    // Ensure cache buffer is large enough
++    err = sdmmc_cache_buffer_ensure_size(&s_read_cache, total_size);
++    if (err != ESP_OK) {
++        xSemaphoreGive(s_read_cache.mutex);
++        return err;
+     }
++
++    // Check if cache buffer is DMA-aligned
++    bool cache_is_aligned = esp_dma_is_buffer_alignment_satisfied(s_read_cache.buffer, total_size, dma_mem_info);
++            #if !SOC_SDMMC_PSRAM_DMA_CAPABLE
++        cache_is_aligned = cache_is_aligned && !esp_ptr_external_ram(s_read_cache.buffer);
++            #endif
++
++    if (cache_is_aligned) {
++        // Read all blocks at once to aligned cache buffer
++        err = sdmmc_read_sectors_dma(card, s_read_cache.buffer, start_block, block_count, total_size);
++            if (err == ESP_OK) {
++                // Copy from cache buffer to destination
++            memcpy(dst, s_read_cache.buffer, total_size);
++            }
++        } else {
++        // Fallback: read one block at a time using the cache buffer
++        // This can happen if cache was allocated in SPIRAM on non-PSRAM-DMA-capable chips
++        uint8_t* cur_dst = (uint8_t*)dst;
++            for (size_t i = 0; i < block_count; ++i) {
++            err = sdmmc_read_sectors_dma(card, s_read_cache.buffer, start_block + i, 1, block_size);
++                if (err != ESP_OK) {
++                ESP_LOGD(TAG, "%s: error 0x%x reading block %zu+%zu",
++                            __func__, err, start_block, i);
++                    break;
++                }
++            memcpy(cur_dst, s_read_cache.buffer, block_size);
++                cur_dst += block_size;
++            }
++        }
++
++    xSemaphoreGive(s_read_cache.mutex);
+     return err;
+ }
+ 
+-- 
+2.34.1
+
