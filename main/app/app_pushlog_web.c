@@ -1,12 +1,18 @@
 #include <string.h>
+#include <stdio.h>
 
 #include "esp_http_server.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "app_pushlog_camera.h"
 #include "app_pushlog_web.h"
 
 static const char *TAG = "pushlog_web";
+static uint8_t *s_frame_buf = NULL;
+static const size_t s_frame_buf_size = 220 * 1024;
 
 static httpd_handle_t s_httpd = NULL;
 
@@ -30,10 +36,12 @@ static const char s_index_html[] =
 "</style></head>\n"
 "<body><div class=\"card\">\n"
 "<h1>Pushlog Camera</h1>\n"
-"<p>Manual capture uploader. Press the button to snap the next frame and send it to Pushlog.</p>\n"
+"<p>High-quality live view with manual Pushlog capture.</p>\n"
+"<img id=\"live\" style=\"width:100%;border-radius:12px;border:1px solid #30384a;background:#111;aspect-ratio:16/9;object-fit:cover;\" src=\"/stream\" alt=\"Live\">\n"
+"<div class=\"hint\">Live MJPEG stream endpoint: /stream (high quality, low fps)</div>\n"
 "<button id=\"snap\" class=\"btn\">Snap & Send to Pushlog</button>\n"
 "<div id=\"status\" class=\"status\"></div>\n"
-"<div class=\"hint\">Tip: On reset, firmware also triggers one immediate upload automatically.</div>\n"
+"<div class=\"hint\">Tip: On device, use rotary knob for zoom/focus (button toggles mode). On reset, firmware also triggers one immediate upload.</div>\n"
 "</div>\n"
 "<script>\n"
 "const b=document.getElementById('snap');const s=document.getElementById('status');\n"
@@ -64,6 +72,69 @@ static esp_err_t snap_post_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "Capture queued, upload in progress shortly");
 }
 
+static esp_err_t jpg_get_handler(httpd_req_t *req)
+{
+    if (!s_frame_buf) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "frame buffer not ready");
+    }
+
+    size_t out_size = 0;
+    esp_err_t ret = app_pushlog_camera_get_web_jpeg(s_frame_buf, s_frame_buf_size, &out_size);
+    if (ret != ESP_OK) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "frame not ready");
+    }
+
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    return httpd_resp_send(req, (const char *)s_frame_buf, out_size);
+}
+
+static esp_err_t stream_get_handler(httpd_req_t *req)
+{
+    static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=frame";
+    static const char *STREAM_BOUNDARY = "\r\n--frame\r\n";
+    static const char *STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+    if (!s_frame_buf) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "frame buffer not ready");
+    }
+
+    esp_err_t ret = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+
+    char part_buf[80];
+    while (1) {
+        size_t out_size = 0;
+        ret = app_pushlog_camera_get_web_jpeg(s_frame_buf, s_frame_buf_size, &out_size);
+        if (ret != ESP_OK || out_size == 0) {
+            vTaskDelay(pdMS_TO_TICKS(15));
+            continue;
+        }
+
+        int header_len = snprintf(part_buf, sizeof(part_buf), STREAM_PART, (unsigned int)out_size);
+        if (header_len <= 0) {
+            return ESP_FAIL;
+        }
+
+        if (httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY)) != ESP_OK ||
+            httpd_resp_send_chunk(req, part_buf, header_len) != ESP_OK ||
+            httpd_resp_send_chunk(req, (const char *)s_frame_buf, out_size) != ESP_OK) {
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+
+    return ESP_OK;
+}
+
 esp_err_t app_pushlog_web_start(void)
 {
     if (s_httpd != NULL) {
@@ -80,6 +151,12 @@ esp_err_t app_pushlog_web_start(void)
         return ret;
     }
 
+    s_frame_buf = heap_caps_malloc(s_frame_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_frame_buf) {
+        ESP_LOGE(TAG, "failed to allocate frame buffer for web stream");
+        return ESP_ERR_NO_MEM;
+    }
+
     httpd_uri_t index_uri = {
         .uri = "/",
         .method = HTTP_GET,
@@ -91,6 +168,20 @@ esp_err_t app_pushlog_web_start(void)
         .uri = "/snap",
         .method = HTTP_POST,
         .handler = snap_post_handler,
+        .user_ctx = NULL,
+    };
+
+    httpd_uri_t jpg_uri = {
+        .uri = "/jpg",
+        .method = HTTP_GET,
+        .handler = jpg_get_handler,
+        .user_ctx = NULL,
+    };
+
+    httpd_uri_t stream_uri = {
+        .uri = "/stream",
+        .method = HTTP_GET,
+        .handler = stream_get_handler,
         .user_ctx = NULL,
     };
 
@@ -106,6 +197,18 @@ esp_err_t app_pushlog_web_start(void)
         return ret;
     }
 
-    ESP_LOGI(TAG, "Web UI started: GET / , POST /snap");
+    ret = httpd_register_uri_handler(s_httpd, &jpg_uri);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "register jpg handler failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = httpd_register_uri_handler(s_httpd, &stream_uri);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "register stream handler failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "Web UI started: GET / , GET /jpg , GET /stream , POST /snap");
     return ESP_OK;
 }

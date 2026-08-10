@@ -2,6 +2,8 @@
 
 #include "esp_err.h"
 #include "driver/i2c_master.h"
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -9,6 +11,13 @@ extern "C" {
 
 esp_err_t app_pushlog_camera_init(i2c_master_bus_handle_t i2c_handle);
 esp_err_t app_pushlog_camera_request_upload_now(void);
+esp_err_t app_pushlog_camera_get_web_jpeg(uint8_t *out_buf, size_t out_buf_size, size_t *out_size);
+esp_err_t app_pushlog_camera_set_zoom(int32_t value);
+esp_err_t app_pushlog_camera_set_focus(int32_t value);
+esp_err_t app_pushlog_camera_set_autofocus(bool enable);
+bool app_pushlog_camera_get_zoom_range(int32_t *min, int32_t *max, int32_t *step, int32_t *cur);
+bool app_pushlog_camera_get_focus_range(int32_t *min, int32_t *max, int32_t *step, int32_t *cur);
+bool app_pushlog_camera_get_autofocus_state(bool *enabled);
 
 #ifdef __cplusplus
 }

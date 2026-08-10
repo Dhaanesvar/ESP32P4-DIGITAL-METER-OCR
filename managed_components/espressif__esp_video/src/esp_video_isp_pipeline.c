@@ -336,14 +336,55 @@ static void config_sharpen(esp_video_isp_t *isp, esp_ipa_metadata_t *metadata)
 
 static void config_gamma(esp_video_isp_t *isp, esp_ipa_metadata_t *metadata)
 {
+    (void)isp;
+    (void)metadata;
+
+    // Keep ISP gamma untouched. This avoids invalid gamma reconfiguration
+    // errors and prevents over-bright curves from being forced at runtime.
+    return;
+
+#if 0
     struct v4l2_ext_controls controls;
     struct v4l2_ext_control control[1];
     esp_video_isp_gamma_t gamma;
 
     if (metadata->flags & IPA_METADATA_FLAGS_GAMMA) {
         gamma.enable = true;
+
+        // ISP requires power-of-two x deltas and last x=255. Build a valid
+        // delta partition of 256 with exactly ISP_GAMMA_CURVE_POINTS_NUM terms.
+        uint16_t deltas[ISP_GAMMA_CURVE_POINTS_NUM] = {0};
+        int delta_count = 1;
+        deltas[0] = 256;
+        while (delta_count < ISP_GAMMA_CURVE_POINTS_NUM) {
+            int split_idx = -1;
+            for (int i = 0; i < delta_count; i++) {
+                if (deltas[i] > 1) {
+                    split_idx = i;
+                    break;
+                }
+            }
+            if (split_idx < 0) {
+                break;
+            }
+
+            uint16_t half = deltas[split_idx] / 2;
+            for (int i = delta_count; i > split_idx; i--) {
+                deltas[i] = deltas[i - 1];
+            }
+            deltas[split_idx] = half;
+            deltas[split_idx + 1] = half;
+            delta_count++;
+        }
+
+        uint32_t x = 0;
         for (int i = 0; i < ISP_GAMMA_CURVE_POINTS_NUM; i++) {
-            gamma.points[i].x = metadata->gamma.x[i];
+            if (i == ISP_GAMMA_CURVE_POINTS_NUM - 1) {
+                gamma.points[i].x = 255;
+            } else {
+                x += deltas[i];
+                gamma.points[i].x = x;
+            }
             gamma.points[i].y = metadata->gamma.y[i];
         }
 
@@ -356,6 +397,7 @@ static void config_gamma(esp_video_isp_t *isp, esp_ipa_metadata_t *metadata)
             ESP_LOGE(TAG, "failed to set GAMMA");
         }
     }
+#endif
 }
 
 static void config_ccm(esp_video_isp_t *isp, esp_ipa_metadata_t *metadata)
