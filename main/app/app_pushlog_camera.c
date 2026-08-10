@@ -1,14 +1,12 @@
 #include <stdbool.h>
 #include <stdint.h>
-#include <string.h>
 
-#include "freertos/FreeRTOS.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_private/esp_cache_private.h"
 #include "esp_timer.h"
-#include "driver/ppa.h"
 #include "driver/jpeg_encode.h"
+#include "driver/ppa.h"
 #include "bsp/esp-bsp.h"
 #include "lvgl.h"
 
@@ -24,22 +22,10 @@ static const char *TAG = "pushlog_cam";
 
 #define CAMERA_WARMUP_FRAMES 30
 #define JPEG_QUALITY 85
-#define JPEG_BUFFER_SIZE (PHOTO_WIDTH_1080P * PHOTO_HEIGHT_1088P * 2)
-#define STREAM_FRAME_WIDTH 640
-#define STREAM_FRAME_HEIGHT 480
-#define STREAM_JPEG_QUALITY 45
-#define STREAM_JPEG_BUFFER_SIZE (STREAM_FRAME_WIDTH * STREAM_FRAME_HEIGHT * 2)
-#define STREAM_UPDATE_INTERVAL_US (150000)
+#define JPEG_BUFFER_SIZE (PHOTO_WIDTH_1080P * PHOTO_HEIGHT_1088P * 2 / 5)
 static int s_video_fd = -1;
 static uint8_t *s_jpeg_buf = NULL;
 static size_t s_jpeg_buf_size = 0;
-static uint8_t *s_stream_rgb_buf = NULL;
-static size_t s_stream_rgb_buf_size = 0;
-static uint8_t *s_stream_jpeg_buf = NULL;
-static size_t s_stream_jpeg_buf_size = 0;
-static size_t s_stream_jpeg_len = 0;
-static int64_t s_last_stream_encode_us = 0;
-static portMUX_TYPE s_stream_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t *s_preview_buf = NULL;
 static size_t s_preview_buf_size = 0;
 static size_t s_cache_line_size = 0;
@@ -48,64 +34,6 @@ static volatile bool s_upload_in_progress = false;
 static uint32_t s_warmup_frames = 0;
 static volatile bool s_manual_upload_requested = false;
 static int64_t s_manual_retry_after_us = 0;
-
-static void pushlog_camera_update_stream_frame(uint8_t *camera_buf,
-                                               uint32_t camera_buf_hes,
-                                               uint32_t camera_buf_ves,
-                                               int64_t now_us)
-{
-    if (!s_stream_rgb_buf || !s_stream_jpeg_buf) {
-        return;
-    }
-
-    if ((now_us - s_last_stream_encode_us) < STREAM_UPDATE_INTERVAL_US) {
-        return;
-    }
-
-    uint32_t crop_width = camera_buf_hes;
-    uint32_t crop_height = camera_buf_ves;
-    uint32_t crop_width_by_height = (camera_buf_ves * 4U) / 3U;
-    if (crop_width_by_height <= camera_buf_hes) {
-        crop_width = crop_width_by_height;
-    } else {
-        crop_height = (camera_buf_hes * 3U) / 4U;
-    }
-
-    esp_err_t ret = app_image_process_scale_crop(
-        camera_buf,
-        camera_buf_hes,
-        camera_buf_ves,
-        crop_width,
-        crop_height,
-        s_stream_rgb_buf,
-        STREAM_FRAME_WIDTH,
-        STREAM_FRAME_HEIGHT,
-        s_stream_rgb_buf_size,
-        PPA_SRM_ROTATION_ANGLE_0
-    );
-    if (ret != ESP_OK) {
-        return;
-    }
-
-    uint32_t stream_jpeg_size = 0;
-    ret = app_image_encode_jpeg(
-        s_stream_rgb_buf,
-        STREAM_FRAME_WIDTH,
-        STREAM_FRAME_HEIGHT,
-        STREAM_JPEG_QUALITY,
-        s_stream_jpeg_buf,
-        s_stream_jpeg_buf_size,
-        &stream_jpeg_size
-    );
-    if (ret != ESP_OK || stream_jpeg_size == 0) {
-        return;
-    }
-
-    portENTER_CRITICAL(&s_stream_lock);
-    s_stream_jpeg_len = stream_jpeg_size;
-    s_last_stream_encode_us = now_us;
-    portEXIT_CRITICAL(&s_stream_lock);
-}
 
 static void pushlog_camera_frame_cb(uint8_t *camera_buf,
                                     uint8_t camera_buf_index,
@@ -121,8 +49,6 @@ static void pushlog_camera_frame_cb(uint8_t *camera_buf,
     }
 
     int64_t now_us = esp_timer_get_time();
-
-    pushlog_camera_update_stream_frame(camera_buf, camera_buf_hes, camera_buf_ves, now_us);
 
     if (s_canvas && s_preview_buf) {
         esp_err_t display_ret = app_image_process_video_frame(
@@ -222,16 +148,14 @@ esp_err_t app_pushlog_camera_init(i2c_master_bus_handle_t i2c_handle)
         return ret;
     }
 
-    ret = esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &s_cache_line_size);
-    if (ret != ESP_OK || s_cache_line_size == 0) {
-        s_cache_line_size = 64;
-    }
-
     if (bsp_display_start()) {
         bsp_display_backlight_on();
 
-        s_preview_buf_size = BSP_LCD_H_RES * BSP_LCD_V_RES * 2;
-        s_preview_buf = heap_caps_aligned_calloc(s_cache_line_size, 1, s_preview_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        ret = esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &s_cache_line_size);
+        if (ret == ESP_OK) {
+            s_preview_buf_size = BSP_LCD_H_RES * BSP_LCD_V_RES * 2;
+            s_preview_buf = heap_caps_aligned_calloc(s_cache_line_size, 1, s_preview_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
 
         if (s_preview_buf) {
             if (bsp_display_lock(1000)) {
@@ -262,26 +186,13 @@ esp_err_t app_pushlog_camera_init(i2c_master_bus_handle_t i2c_handle)
     jpeg_encode_memory_alloc_cfg_t jpeg_mem_cfg = {
         .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER,
     };
-    s_jpeg_buf = (uint8_t *)jpeg_alloc_encoder_mem(JPEG_BUFFER_SIZE, &jpeg_mem_cfg, &s_jpeg_buf_size);
+    size_t jpeg_buf_size = 0;
+    s_jpeg_buf = (uint8_t *)jpeg_alloc_encoder_mem(JPEG_BUFFER_SIZE, &jpeg_mem_cfg, &jpeg_buf_size);
+    s_jpeg_buf_size = jpeg_buf_size;
     if (s_jpeg_buf == NULL) {
         ESP_LOGE(TAG, "failed to allocate JPEG buffer");
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "JPEG output buffer allocated: requested=%u actual=%u", (unsigned)JPEG_BUFFER_SIZE, (unsigned)s_jpeg_buf_size);
-
-    s_stream_rgb_buf_size = STREAM_FRAME_WIDTH * STREAM_FRAME_HEIGHT * 2;
-    s_stream_rgb_buf = heap_caps_aligned_calloc(s_cache_line_size, 1, s_stream_rgb_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_stream_rgb_buf == NULL) {
-        ESP_LOGE(TAG, "failed to allocate stream RGB buffer");
-        return ESP_ERR_NO_MEM;
-    }
-
-    s_stream_jpeg_buf = (uint8_t *)jpeg_alloc_encoder_mem(STREAM_JPEG_BUFFER_SIZE, &jpeg_mem_cfg, &s_stream_jpeg_buf_size);
-    if (s_stream_jpeg_buf == NULL) {
-        ESP_LOGE(TAG, "failed to allocate stream JPEG buffer");
-        return ESP_ERR_NO_MEM;
-    }
-    ESP_LOGI(TAG, "Stream JPEG buffer allocated: requested=%u actual=%u", (unsigned)STREAM_JPEG_BUFFER_SIZE, (unsigned)s_stream_jpeg_buf_size);
 
     ret = app_video_register_frame_operation_cb(pushlog_camera_frame_cb);
     if (ret != ESP_OK) {
@@ -311,34 +222,5 @@ esp_err_t app_pushlog_camera_request_upload_now(void)
 
     s_manual_upload_requested = true;
     s_manual_retry_after_us = 0;
-    return ESP_OK;
-}
-
-esp_err_t app_pushlog_camera_copy_latest_stream_jpeg(uint8_t *dst, size_t dst_size, size_t *out_size)
-{
-    if (!dst || !out_size) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if (s_video_fd < 0 || !s_stream_jpeg_buf) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    size_t len = 0;
-    portENTER_CRITICAL(&s_stream_lock);
-    len = s_stream_jpeg_len;
-    if (len > 0 && len <= dst_size) {
-        memcpy(dst, s_stream_jpeg_buf, len);
-    }
-    portEXIT_CRITICAL(&s_stream_lock);
-
-    if (len == 0) {
-        return ESP_ERR_NOT_FOUND;
-    }
-    if (len > dst_size) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    *out_size = len;
     return ESP_OK;
 }

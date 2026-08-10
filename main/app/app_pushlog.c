@@ -277,15 +277,7 @@ esp_err_t app_pushlog_upload_jpeg(const uint8_t *jpeg_data, size_t jpeg_len)
     char uid[13] = {0};
     char url[192] = {0};
 
-    esp_err_t mac_ret = esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    if (mac_ret != ESP_OK) {
-        mac_ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
-    }
-    if (mac_ret != ESP_OK) {
-        ESP_LOGW(TAG, "failed to get STA MAC, using fallback UID: %s", esp_err_to_name(mac_ret));
-        memset(mac, 0, sizeof(mac));
-    }
-
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_read_mac(mac, ESP_MAC_WIFI_STA));
     snprintf(uid, sizeof(uid), "%02X%02X%02X%02X%02X%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     snprintf(url, sizeof(url), PUSHLOG_URL_FMT, uid);
