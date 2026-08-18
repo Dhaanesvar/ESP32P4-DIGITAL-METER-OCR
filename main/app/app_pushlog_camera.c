@@ -1,6 +1,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <ctype.h>
 #include <sys/ioctl.h>
 
 #include "esp_heap_caps.h"
@@ -11,7 +12,9 @@
 #include "driver/ppa.h"
 #include "bsp/esp-bsp.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "iot_button.h"
 #include "iot_knob.h"
 #include "linux/v4l2-controls.h"
@@ -22,6 +25,8 @@
 
 #include "app_pushlog.h"
 #include "app_pushlog_camera.h"
+#include "AI/app_pushlog_ai_overlay.h"
+#include "AI/app_simple_ocr_c.h"
 #include "app_video.h"
 #include "app_video_stream.h"
 #include "app_video_utils.h"
@@ -29,14 +34,25 @@
 static const char *TAG = "pushlog_cam";
 
 #define CAMERA_WARMUP_FRAMES 30
-#define JPEG_QUALITY 85
+#define JPEG_QUALITY 80
+#define JPEG_QUALITY_FALLBACK 55
+#define MAX_MODEM_UPLOAD_JPEG_SIZE (320U * 1024U)
 #define JPEG_BUFFER_SIZE (PHOTO_WIDTH_1080P * PHOTO_HEIGHT_1088P * 2 / 5)
-#define WEB_STREAM_WIDTH 1280
-#define WEB_STREAM_HEIGHT 720
-#define WEB_STREAM_QUALITY 92
-#define WEB_FRAME_INTERVAL_US 200000
+#define WEB_STREAM_WIDTH 960
+#define WEB_STREAM_HEIGHT 540
+#define WEB_STREAM_QUALITY 82
+#define WEB_FRAME_INTERVAL_US 100000
 #define WEB_RGB_BUF_SIZE (WEB_STREAM_WIDTH * WEB_STREAM_HEIGHT * 2)
 #define WEB_JPEG_BUF_SIZE (WEB_RGB_BUF_SIZE / 3)
+#define UPLOAD_QUEUE_LEN 4
+#define METER_EXPECTED_DIGITS 9
+#define OCR_ROI_X0_PCT 32
+#define OCR_ROI_X1_PCT 68
+#define OCR_ROI_Y0_PCT 36
+#define OCR_ROI_Y1_PCT 62
+// Optional board button/knob controls can trigger GPIO ISR allocation issues
+// on some firmware/component mixes; keep disabled for web-only pushlog flow.
+static const bool kEnableHwControls = true;
 static int s_video_fd = -1;
 static uint8_t *s_jpeg_buf = NULL;
 static size_t s_jpeg_buf_size = 0;
@@ -50,10 +66,30 @@ static int64_t s_last_web_frame_us = 0;
 static SemaphoreHandle_t s_web_jpeg_mutex = NULL;
 static size_t s_cache_line_size = 0;
 static lv_obj_t *s_canvas = NULL;
-static volatile bool s_upload_in_progress = false;
 static uint32_t s_warmup_frames = 0;
 static volatile bool s_manual_upload_requested = false;
 static int64_t s_manual_retry_after_us = 0;
+static int64_t s_web_pause_until_us = 0;
+static QueueHandle_t s_upload_queue = NULL;
+static TaskHandle_t s_upload_task = NULL;
+static SemaphoreHandle_t s_ocr_mutex = NULL;
+static char s_last_meter_reading[32] = {0};
+static float s_last_meter_score = 0.0f;
+static uint32_t s_last_meter_seq = 0;
+static volatile bool s_last_digit_box_valid = false;
+static volatile int s_last_digit_box_x0 = 0;
+static volatile int s_last_digit_box_x1 = 0;
+static volatile int s_last_digit_box_y0 = 0;
+static volatile int s_last_digit_box_y1 = 0;
+
+typedef struct {
+    uint8_t *jpeg_data;
+    size_t jpeg_len;
+    bool manual;
+    uint8_t retry_count;
+    char ocr_word[32];
+    float ocr_score;
+} upload_job_t;
 
 typedef struct {
     bool supported;
@@ -81,6 +117,729 @@ static volatile int s_digital_zoom_level = 1; // 1..4
 esp_err_t app_pushlog_camera_set_zoom(int32_t value);
 esp_err_t app_pushlog_camera_set_focus(int32_t value);
 esp_err_t app_pushlog_camera_set_autofocus(bool enable);
+esp_err_t app_pushlog_camera_request_upload_now(void);
+
+static bool map_ocr_char_to_meter_digit(char c, char *digit, float *weight, bool *is_exact)
+{
+    if (!digit || !weight || !is_exact) {
+        return false;
+    }
+
+    char u = (char)toupper((unsigned char)c);
+    if (u >= '0' && u <= '9') {
+        *digit = u;
+        *weight = 1.0f;
+        *is_exact = true;
+        return true;
+    }
+
+    *is_exact = false;
+    switch (u) {
+        case 'O':
+        case 'Q':
+        case 'D':
+            *digit = '0';
+            *weight = 0.82f;
+            return true;
+        case 'I':
+        case 'L':
+            *digit = '1';
+            *weight = 0.78f;
+            return true;
+        case 'Z':
+            *digit = '2';
+            *weight = 0.72f;
+            return true;
+        case 'A':
+        case 'H':
+            *digit = '4';
+            *weight = 0.68f;
+            return true;
+        case 'S':
+            *digit = '5';
+            *weight = 0.70f;
+            return true;
+        case 'G':
+            *digit = '6';
+            *weight = 0.66f;
+            return true;
+        case 'T':
+            *digit = '7';
+            *weight = 0.64f;
+            return true;
+        case 'B':
+            *digit = '8';
+            *weight = 0.55f;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool extract_meter_reading(const char *ocr_word, char *out_reading, size_t out_size)
+{
+    if (!ocr_word || !out_reading || out_size < 2) {
+        return false;
+    }
+
+    char exact_digits[32] = {0};
+    char mapped_digits[32] = {0};
+    size_t exact_n = 0;
+    size_t mapped_n = 0;
+
+    for (size_t i = 0; ocr_word[i] != '\0'; ++i) {
+        char d = '\0';
+        float w = 0.0f;
+        bool ex = false;
+        if (!map_ocr_char_to_meter_digit(ocr_word[i], &d, &w, &ex)) {
+            continue;
+        }
+
+        if (ex && exact_n < (sizeof(exact_digits) - 1)) {
+            exact_digits[exact_n++] = d;
+        }
+        if (mapped_n < (sizeof(mapped_digits) - 1)) {
+            mapped_digits[mapped_n++] = d;
+        }
+    }
+
+    exact_digits[exact_n] = '\0';
+    mapped_digits[mapped_n] = '\0';
+
+    // Prefer exact 9-digit sequence. Keep leading zeros.
+    if (exact_n >= METER_EXPECTED_DIGITS && out_size > METER_EXPECTED_DIGITS) {
+        size_t start = exact_n - METER_EXPECTED_DIGITS;
+        memcpy(out_reading, &exact_digits[start], METER_EXPECTED_DIGITS);
+        out_reading[METER_EXPECTED_DIGITS] = '\0';
+        return true;
+    }
+
+    // Fallback: use mapped 9-digit sequence to preserve zeros and ambiguous digits.
+    if (mapped_n >= METER_EXPECTED_DIGITS && out_size > METER_EXPECTED_DIGITS) {
+        size_t start = mapped_n - METER_EXPECTED_DIGITS;
+        memcpy(out_reading, &mapped_digits[start], METER_EXPECTED_DIGITS);
+        out_reading[METER_EXPECTED_DIGITS] = '\0';
+        return true;
+    }
+
+    // Build digit runs from OCR text and pick the best contiguous run.
+    // This avoids gluing unrelated noisy digits from separate regions.
+    typedef struct {
+        size_t start;
+        size_t len;
+        float weight_sum;
+        int exact_count;
+    } run_t;
+
+    run_t best = {0};
+    bool in_run = false;
+    run_t cur = {0};
+
+    for (size_t i = 0; ocr_word[i] != '\0'; ++i) {
+        char d = '\0';
+        float w = 0.0f;
+        bool ex = false;
+        bool ok = map_ocr_char_to_meter_digit(ocr_word[i], &d, &w, &ex);
+
+        if (ok) {
+            if (!in_run) {
+                in_run = true;
+                cur.start = i;
+                cur.len = 0;
+                cur.weight_sum = 0.0f;
+                cur.exact_count = 0;
+            }
+            cur.len++;
+            cur.weight_sum += w;
+            if (ex) {
+                cur.exact_count++;
+            }
+        }
+
+        if ((!ok || ocr_word[i + 1] == '\0') && in_run) {
+            float cur_avg = cur.len ? (cur.weight_sum / (float)cur.len) : 0.0f;
+            float best_avg = best.len ? (best.weight_sum / (float)best.len) : -1.0f;
+
+            bool better = false;
+            if (cur.len >= 4 && best.len < 4) {
+                better = true;
+            } else if ((cur.len >= 4) == (best.len >= 4)) {
+                if (cur_avg > best_avg + 0.04f) {
+                    better = true;
+                } else if (cur_avg >= best_avg - 0.02f) {
+                    if (cur.exact_count > best.exact_count) {
+                        better = true;
+                    } else if (cur.exact_count == best.exact_count && cur.len > best.len) {
+                        better = true;
+                    }
+                }
+            }
+
+            if (better || best.len == 0) {
+                best = cur;
+            }
+            in_run = false;
+        }
+    }
+
+    if (best.len < METER_EXPECTED_DIGITS) {
+        out_reading[0] = '\0';
+        return false;
+    }
+
+    size_t n = 0;
+    for (size_t i = best.start; ocr_word[i] != '\0' && n < (out_size - 1); ++i) {
+        char d = '\0';
+        float w = 0.0f;
+        bool ex = false;
+        if (!map_ocr_char_to_meter_digit(ocr_word[i], &d, &w, &ex)) {
+            if (n > 0) {
+                break;
+            }
+            continue;
+        }
+        out_reading[n++] = d;
+        if (n >= best.len) {
+            break;
+        }
+    }
+
+    out_reading[n] = '\0';
+    if (n < METER_EXPECTED_DIGITS || out_size <= METER_EXPECTED_DIGITS) {
+        out_reading[0] = '\0';
+        return false;
+    }
+
+    if (n > METER_EXPECTED_DIGITS) {
+        size_t start = n - METER_EXPECTED_DIGITS;
+        memmove(out_reading, &out_reading[start], METER_EXPECTED_DIGITS);
+    }
+    out_reading[METER_EXPECTED_DIGITS] = '\0';
+    return true;
+}
+
+static bool extract_meter_fallback(const char *ocr_word, char *out_reading, size_t out_size)
+{
+    if (!ocr_word || !out_reading || out_size < 2) {
+        return false;
+    }
+
+    size_t n = 0;
+    for (size_t i = 0; ocr_word[i] != '\0'; ++i) {
+        char d = '\0';
+        float w = 0.0f;
+        bool ex = false;
+        if (map_ocr_char_to_meter_digit(ocr_word[i], &d, &w, &ex)) {
+            if (n < (out_size - 1)) {
+                out_reading[n++] = d;
+            }
+        }
+    }
+    out_reading[n] = '\0';
+    if (n < METER_EXPECTED_DIGITS || out_size <= METER_EXPECTED_DIGITS) {
+        out_reading[0] = '\0';
+        return false;
+    }
+
+    if (n > METER_EXPECTED_DIGITS) {
+        size_t start = n - METER_EXPECTED_DIGITS;
+        memmove(out_reading, &out_reading[start], METER_EXPECTED_DIGITS);
+    }
+    out_reading[METER_EXPECTED_DIGITS] = '\0';
+    return true;
+}
+
+static bool extract_any_digits(const char *ocr_word, char *out_reading, size_t out_size)
+{
+    if (!ocr_word || !out_reading || out_size < 2) {
+        return false;
+    }
+
+    size_t n = 0;
+    for (size_t i = 0; ocr_word[i] != '\0'; ++i) {
+        char d = '\0';
+        float w = 0.0f;
+        bool ex = false;
+        if (map_ocr_char_to_meter_digit(ocr_word[i], &d, &w, &ex)) {
+            if (n < (out_size - 1)) {
+                out_reading[n++] = d;
+            }
+        }
+    }
+    out_reading[n] = '\0';
+    return n > 0;
+}
+
+static void get_ocr_roi(int width, int height, int *x0, int *x1, int *y0, int *y1)
+{
+    int rx0 = (width * OCR_ROI_X0_PCT) / 100;
+    int rx1 = (width * OCR_ROI_X1_PCT) / 100;
+    int ry0 = (height * OCR_ROI_Y0_PCT) / 100;
+    int ry1 = (height * OCR_ROI_Y1_PCT) / 100;
+
+    if (rx1 <= rx0 + 40) {
+        rx1 = rx0 + 40;
+    }
+    if (ry1 <= ry0 + 20) {
+        ry1 = ry0 + 20;
+    }
+    if (rx1 > width) {
+        rx1 = width;
+    }
+    if (ry1 > height) {
+        ry1 = height;
+    }
+
+    *x0 = rx0;
+    *x1 = rx1;
+    *y0 = ry0;
+    *y1 = ry1;
+}
+
+static void draw_ocr_roi_box(uint16_t *buf, int width, int height)
+{
+    if (!buf || width <= 0 || height <= 0) {
+        return;
+    }
+
+    int x0 = (width * OCR_ROI_X0_PCT) / 100;
+    int x1 = (width * OCR_ROI_X1_PCT) / 100;
+    int y0 = (height * OCR_ROI_Y0_PCT) / 100;
+    int y1 = (height * OCR_ROI_Y1_PCT) / 100;
+
+    if (x0 < 0) {
+        x0 = 0;
+    }
+    if (y0 < 0) {
+        y0 = 0;
+    }
+    if (x1 >= width) {
+        x1 = width - 1;
+    }
+    if (y1 >= height) {
+        y1 = height - 1;
+    }
+    if (x1 <= x0 || y1 <= y0) {
+        return;
+    }
+
+    const uint16_t green = 0x07E0; // RGB565 pure green
+    const int thick = 3;
+
+    for (int t = 0; t < thick; ++t) {
+        int yt = y0 + t;
+        int yb = y1 - t;
+        if (yt >= 0 && yt < height) {
+            for (int x = x0; x <= x1; ++x) {
+                buf[yt * width + x] = green;
+            }
+        }
+        if (yb >= 0 && yb < height && yb != yt) {
+            for (int x = x0; x <= x1; ++x) {
+                buf[yb * width + x] = green;
+            }
+        }
+    }
+
+    for (int t = 0; t < thick; ++t) {
+        int xl = x0 + t;
+        int xr = x1 - t;
+        if (xl >= 0 && xl < width) {
+            for (int y = y0; y <= y1; ++y) {
+                buf[y * width + xl] = green;
+            }
+        }
+        if (xr >= 0 && xr < width && xr != xl) {
+            for (int y = y0; y <= y1; ++y) {
+                buf[y * width + xr] = green;
+            }
+        }
+    }
+
+    // Draw refined digit region as yellow to match precise detection area.
+    if (s_last_digit_box_valid) {
+        int dx0 = s_last_digit_box_x0;
+        int dx1 = s_last_digit_box_x1;
+        int dy0 = s_last_digit_box_y0;
+        int dy1 = s_last_digit_box_y1;
+
+        if (dx0 < 0) {
+            dx0 = 0;
+        }
+        if (dy0 < 0) {
+            dy0 = 0;
+        }
+        if (dx1 >= width) {
+            dx1 = width - 1;
+        }
+        if (dy1 >= height) {
+            dy1 = height - 1;
+        }
+
+        if (dx1 > dx0 && dy1 > dy0) {
+            const uint16_t yellow = 0xFFE0; // RGB565 yellow
+            const int dthick = 2;
+
+            for (int t = 0; t < dthick; ++t) {
+                int yt = dy0 + t;
+                int yb = dy1 - t;
+                if (yt >= 0 && yt < height) {
+                    for (int x = dx0; x <= dx1; ++x) {
+                        buf[yt * width + x] = yellow;
+                    }
+                }
+                if (yb >= 0 && yb < height && yb != yt) {
+                    for (int x = dx0; x <= dx1; ++x) {
+                        buf[yb * width + x] = yellow;
+                    }
+                }
+            }
+
+            for (int t = 0; t < dthick; ++t) {
+                int xl = dx0 + t;
+                int xr = dx1 - t;
+                if (xl >= 0 && xl < width) {
+                    for (int y = dy0; y <= dy1; ++y) {
+                        buf[y * width + xl] = yellow;
+                    }
+                }
+                if (xr >= 0 && xr < width && xr != xl) {
+                    for (int y = dy0; y <= dy1; ++y) {
+                        buf[y * width + xr] = yellow;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void clamp_roi(int width, int height, int *x0, int *x1, int *y0, int *y1)
+{
+    if (*x0 < 0) {
+        *x0 = 0;
+    }
+    if (*y0 < 0) {
+        *y0 = 0;
+    }
+    if (*x1 > width) {
+        *x1 = width;
+    }
+    if (*y1 > height) {
+        *y1 = height;
+    }
+    if (*x1 <= *x0 + 40) {
+        *x1 = (*x0 + 40 <= width) ? (*x0 + 40) : width;
+        *x0 = (*x1 >= 40) ? (*x1 - 40) : 0;
+    }
+    if (*y1 <= *y0 + 20) {
+        *y1 = (*y0 + 20 <= height) ? (*y0 + 20) : height;
+        *y0 = (*y1 >= 20) ? (*y1 - 20) : 0;
+    }
+}
+
+static void update_best_ocr_candidate(const char *word,
+                                      float score,
+                                      int stage,
+                                      int x0,
+                                      int x1,
+                                      int y0,
+                                      int y1,
+                                      char *best_word,
+                                      size_t best_word_size,
+                                      float *best_score,
+                                      int *best_stage,
+                                      int *best_x0,
+                                      int *best_x1,
+                                      int *best_y0,
+                                      int *best_y1,
+                                      int *best_digits,
+                                      int *best_exact_digits)
+{
+    int digits = 0;
+    int exact_digits = 0;
+    for (size_t i = 0; word[i] != '\0'; ++i) {
+        char d = '\0';
+        float w = 0.0f;
+        bool ex = false;
+        if (map_ocr_char_to_meter_digit(word[i], &d, &w, &ex)) {
+            digits++;
+            if (ex) {
+                exact_digits++;
+            }
+        }
+    }
+
+    bool better = false;
+    if (digits > *best_digits) {
+        better = true;
+    } else if (digits == *best_digits) {
+        if (exact_digits > *best_exact_digits) {
+            better = true;
+        } else if (exact_digits == *best_exact_digits && score > *best_score) {
+            better = true;
+        }
+    }
+
+    if (better) {
+        strncpy(best_word, word, best_word_size - 1);
+        best_word[best_word_size - 1] = '\0';
+        *best_score = score;
+        *best_stage = stage;
+        *best_x0 = x0;
+        *best_x1 = x1;
+        *best_y0 = y0;
+        *best_y1 = y1;
+        *best_digits = digits;
+        *best_exact_digits = exact_digits;
+    }
+}
+
+static bool run_ocr_with_fallbacks(const uint16_t *frame,
+                                   int width,
+                                   int height,
+                                   char *ocr_word,
+                                   size_t ocr_word_size,
+                                   float *ocr_score,
+                                   int *used_stage,
+                                   int *used_x0,
+                                   int *used_x1,
+                                   int *used_y0,
+                                   int *used_y1)
+{
+    if (!frame || !ocr_word || ocr_word_size < 2 || !ocr_score) {
+        return false;
+    }
+
+    int bx0 = 0;
+    int bx1 = 0;
+    int by0 = 0;
+    int by1 = 0;
+    get_ocr_roi(width, height, &bx0, &bx1, &by0, &by1);
+
+    typedef struct {
+        int x0;
+        int x1;
+        int y0;
+        int y1;
+    } roi_t;
+
+    int pad_w1 = width / 16;
+    int pad_h1 = height / 20;
+    int pad_w2 = width / 10;
+    int pad_h2 = height / 12;
+    int y_shift = height / 12;
+
+    roi_t rois[6] = {
+        {bx0, bx1, by0, by1},
+        {bx0 - pad_w1, bx1 + pad_w1, by0 - pad_h1, by1 + pad_h1},
+        {bx0 - pad_w2, bx1 + pad_w2, by0 - pad_h2, by1 + pad_h2},
+        {bx0, bx1, by0 - y_shift, by1 - y_shift},
+        {bx0, bx1, by0 + y_shift, by1 + y_shift},
+        {width / 6, (width * 5) / 6, height / 4, (height * 3) / 4},
+    };
+
+    char best_word[32] = {0};
+    float best_score = 0.0f;
+    int best_stage = -1;
+    int best_x0 = 0;
+    int best_x1 = 0;
+    int best_y0 = 0;
+    int best_y1 = 0;
+    int best_digits = -1;
+    int best_exact_digits = -1;
+
+    for (int i = 0; i < 6; ++i) {
+        int x0 = rois[i].x0;
+        int x1 = rois[i].x1;
+        int y0 = rois[i].y0;
+        int y1 = rois[i].y1;
+        clamp_roi(width, height, &x0, &x1, &y0, &y1);
+
+        bool ok = app_simple_ocr_extract_word_c_roi(frame,
+                                                    width,
+                                                    height,
+                                                    x0,
+                                                    x1,
+                                                    y0,
+                                                    y1,
+                                                    ocr_word,
+                                                    ocr_word_size,
+                                                    ocr_score);
+        if (ok) {
+            update_best_ocr_candidate(ocr_word,
+                                      *ocr_score,
+                                      i,
+                                      x0,
+                                      x1,
+                                      y0,
+                                      y1,
+                                      best_word,
+                                      sizeof(best_word),
+                                      &best_score,
+                                      &best_stage,
+                                      &best_x0,
+                                      &best_x1,
+                                      &best_y0,
+                                      &best_y1,
+                                      &best_digits,
+                                      &best_exact_digits);
+        }
+    }
+
+    bool full_ok = app_simple_ocr_extract_word_c(frame, width, height, ocr_word, ocr_word_size, ocr_score);
+    if (full_ok) {
+        update_best_ocr_candidate(ocr_word,
+                                  *ocr_score,
+                                  99,
+                                  0,
+                                  width,
+                                  0,
+                                  height,
+                                  best_word,
+                                  sizeof(best_word),
+                                  &best_score,
+                                  &best_stage,
+                                  &best_x0,
+                                  &best_x1,
+                                  &best_y0,
+                                  &best_y1,
+                                  &best_digits,
+                                  &best_exact_digits);
+    }
+
+    if (best_stage < 0 || best_digits <= 0) {
+        return false;
+    }
+
+    int refined_x0 = 0;
+    int refined_x1 = 0;
+    int refined_y0 = 0;
+    int refined_y1 = 0;
+    if (app_simple_ocr_refine_digit_roi_c(frame,
+                                          width,
+                                          height,
+                                          best_x0,
+                                          best_x1,
+                                          best_y0,
+                                          best_y1,
+                                          &refined_x0,
+                                          &refined_x1,
+                                          &refined_y0,
+                                          &refined_y1)) {
+        best_x0 = refined_x0;
+        best_x1 = refined_x1;
+        best_y0 = refined_y0;
+        best_y1 = refined_y1;
+    }
+
+    strncpy(ocr_word, best_word, ocr_word_size - 1);
+    ocr_word[ocr_word_size - 1] = '\0';
+    *ocr_score = best_score;
+    if (used_stage) {
+        *used_stage = best_stage;
+    }
+    if (used_x0) {
+        *used_x0 = best_x0;
+    }
+    if (used_x1) {
+        *used_x1 = best_x1;
+    }
+    if (used_y0) {
+        *used_y0 = best_y0;
+    }
+    if (used_y1) {
+        *used_y1 = best_y1;
+    }
+    return true;
+}
+
+static bool enqueue_upload_job(uint8_t *jpeg_data,
+                               size_t jpeg_len,
+                               bool manual,
+                               const char *ocr_word,
+                               float ocr_score)
+{
+    if (!s_upload_queue || !jpeg_data || jpeg_len == 0) {
+        return false;
+    }
+
+    upload_job_t job = {
+        .jpeg_data = jpeg_data,
+        .jpeg_len = jpeg_len,
+        .manual = manual,
+        .retry_count = 0,
+        .ocr_score = ocr_score,
+    };
+    if (ocr_word && ocr_word[0] != '\0') {
+        strncpy(job.ocr_word, ocr_word, sizeof(job.ocr_word) - 1);
+        job.ocr_word[sizeof(job.ocr_word) - 1] = '\0';
+    } else {
+        job.ocr_word[0] = '\0';
+    }
+
+    BaseType_t ok = manual
+        ? xQueueSendToFront(s_upload_queue, &job, 0)
+        : xQueueSendToBack(s_upload_queue, &job, 0);
+
+    if (ok == pdTRUE) {
+        return true;
+    }
+
+    if (manual) {
+        upload_job_t dropped;
+        if (xQueueReceive(s_upload_queue, &dropped, 0) == pdTRUE) {
+            if (dropped.jpeg_data) {
+                heap_caps_free(dropped.jpeg_data);
+            }
+            ok = xQueueSendToFront(s_upload_queue, &job, 0);
+            if (ok == pdTRUE) {
+                ESP_LOGW(TAG, "upload queue full; dropped oldest job to prioritize manual snap");
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static void pushlog_upload_task(void *arg)
+{
+    (void)arg;
+    upload_job_t job;
+
+    while (1) {
+        if (xQueueReceive(s_upload_queue, &job, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        esp_err_t ret = app_pushlog_upload_jpeg(job.jpeg_data,
+                            job.jpeg_len,
+                            job.ocr_word,
+                            job.ocr_score);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Pushlog upload failed: %s", esp_err_to_name(ret));
+
+            if (job.manual && job.retry_count < 30) {
+                job.retry_count++;
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                if (xQueueSendToFront(s_upload_queue, &job, 0) == pdTRUE) {
+                    ESP_LOGW(TAG, "Manual/boot upload retry %d/30", job.retry_count);
+                    continue;
+                }
+            }
+        } else {
+            if (job.manual) {
+                ESP_LOGI(TAG, "Manual/boot Pushlog upload successful");
+            } else {
+                ESP_LOGI(TAG, "Periodic Pushlog upload successful");
+            }
+        }
+
+        if (job.jpeg_data) {
+            heap_caps_free(job.jpeg_data);
+        }
+    }
+}
 
 static int32_t clamp_ctrl_value(int32_t value, int32_t min, int32_t max, int32_t step)
 {
@@ -162,13 +921,26 @@ static void mode_button_cb(void *arg, void *data)
         if (s_autofocus_supported) {
             (void)app_pushlog_camera_set_autofocus(false);
         }
-        ESP_LOGI(TAG, "Knob mode: FOCUS");
+        ESP_LOGI(TAG, "Knob mode: FOCUS (AI mode: face)");
     } else {
         s_knob_mode = KNOB_CTRL_ZOOM;
         if (s_autofocus_supported) {
             (void)app_pushlog_camera_set_autofocus(true);
         }
-        ESP_LOGI(TAG, "Knob mode: ZOOM");
+        ESP_LOGI(TAG, "Knob mode: ZOOM (AI mode: pedestrian)");
+    }
+}
+
+static void snap_button_cb(void *arg, void *data)
+{
+    (void)arg;
+    (void)data;
+
+    esp_err_t ret = app_pushlog_camera_request_upload_now();
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "User button snap requested");
+    } else {
+        ESP_LOGW(TAG, "User button snap request failed: %s", esp_err_to_name(ret));
     }
 }
 
@@ -176,7 +948,9 @@ static void init_hw_controls(void)
 {
     esp_err_t ret = bsp_iot_button_create(s_buttons, NULL, BSP_BUTTON_NUM);
     if (ret == ESP_OK) {
-        (void)iot_button_register_cb(s_buttons[BSP_BUTTON_1], BUTTON_PRESS_DOWN, NULL, mode_button_cb, NULL);
+        // Single click: capture/upload now. Long press: toggle knob control mode.
+        (void)iot_button_register_cb(s_buttons[BSP_BUTTON_1], BUTTON_SINGLE_CLICK, NULL, snap_button_cb, NULL);
+        (void)iot_button_register_cb(s_buttons[BSP_BUTTON_1], BUTTON_LONG_PRESS_START, NULL, mode_button_cb, NULL);
     } else {
         ESP_LOGW(TAG, "button init failed: %s", esp_err_to_name(ret));
     }
@@ -278,6 +1052,12 @@ static void init_web_cam_ctrls(void)
              s_zoom_info.supported ? "yes" : "no",
              s_focus_info.supported ? "yes" : "no",
              s_autofocus_supported ? "yes" : "no");
+
+    if (s_autofocus_supported && !s_autofocus_enabled) {
+        if (app_pushlog_camera_set_autofocus(true) == ESP_OK) {
+            ESP_LOGI(TAG, "autofocus enabled at startup");
+        }
+    }
 }
 
 static void pushlog_camera_frame_cb(uint8_t *camera_buf,
@@ -295,6 +1075,41 @@ static void pushlog_camera_frame_cb(uint8_t *camera_buf,
 
     int64_t now_us = esp_timer_get_time();
 
+    // Update precise digit ROI from live frame for yellow overlay box.
+    {
+        int rx0 = 0;
+        int rx1 = 0;
+        int ry0 = 0;
+        int ry1 = 0;
+        get_ocr_roi((int)camera_buf_hes, (int)camera_buf_ves, &rx0, &rx1, &ry0, &ry1);
+
+        int dx0 = 0;
+        int dx1 = 0;
+        int dy0 = 0;
+        int dy1 = 0;
+        bool refined_ok = app_simple_ocr_refine_digit_roi_c((const uint16_t *)camera_buf,
+                                                             (int)camera_buf_hes,
+                                                             (int)camera_buf_ves,
+                                                             rx0,
+                                                             rx1,
+                                                             ry0,
+                                                             ry1,
+                                                             &dx0,
+                                                             &dx1,
+                                                             &dy0,
+                                                             &dy1);
+
+        if (refined_ok) {
+            s_last_digit_box_x0 = (dx0 * BSP_LCD_H_RES) / (int)camera_buf_hes;
+            s_last_digit_box_x1 = (dx1 * BSP_LCD_H_RES) / (int)camera_buf_hes;
+            s_last_digit_box_y0 = (dy0 * BSP_LCD_V_RES) / (int)camera_buf_ves;
+            s_last_digit_box_y1 = (dy1 * BSP_LCD_V_RES) / (int)camera_buf_ves;
+            s_last_digit_box_valid = true;
+        } else {
+            s_last_digit_box_valid = false;
+        }
+    }
+
     if (s_canvas && s_preview_buf) {
         esp_err_t display_ret = app_image_process_video_frame(
             camera_buf,
@@ -307,6 +1122,10 @@ static void pushlog_camera_frame_cb(uint8_t *camera_buf,
         );
 
         if (display_ret == ESP_OK) {
+            bool face_mode = (s_knob_mode == KNOB_CTRL_FOCUS);
+            app_pushlog_ai_overlay((uint16_t *)s_preview_buf, BSP_LCD_H_RES, BSP_LCD_V_RES, face_mode);
+            draw_ocr_roi_box((uint16_t *)s_preview_buf, BSP_LCD_H_RES, BSP_LCD_V_RES);
+
             bsp_display_lock(0);
             lv_canvas_set_buffer(s_canvas, s_preview_buf, BSP_LCD_H_RES, BSP_LCD_V_RES, PREVIEW_CANVAS_COLOR_FORMAT);
             lv_refr_now(NULL);
@@ -314,7 +1133,162 @@ static void pushlog_camera_frame_cb(uint8_t *camera_buf,
         }
     }
 
-    if (s_web_rgb_buf && s_web_jpeg_buf && s_web_jpeg_mutex) {
+    bool force_capture = false;
+    if (s_manual_upload_requested && now_us >= s_manual_retry_after_us) {
+        force_capture = true;
+        s_manual_upload_requested = false;
+    }
+
+    if (!force_capture && s_warmup_frames < CAMERA_WARMUP_FRAMES) {
+        s_warmup_frames++;
+        return;
+    }
+
+    if (!force_capture && !app_pushlog_should_capture_now()) {
+        // No Pushlog work due now; allow web frame generation below.
+    } else {
+        int roi_x0 = 0;
+        int roi_x1 = 0;
+        int roi_y0 = 0;
+        int roi_y1 = 0;
+        int ocr_stage = -1;
+
+        char ocr_word[32] = {0};
+        char meter_reading[32] = {0};
+        float ocr_score = 0.0f;
+        bool ocr_ok = run_ocr_with_fallbacks((const uint16_t *)camera_buf,
+                             (int)camera_buf_hes,
+                             (int)camera_buf_ves,
+                             ocr_word,
+                             sizeof(ocr_word),
+                             &ocr_score,
+                             &ocr_stage,
+                             &roi_x0,
+                             &roi_x1,
+                             &roi_y0,
+                             &roi_y1);
+        bool meter_ok = ocr_ok && extract_meter_reading(ocr_word, meter_reading, sizeof(meter_reading));
+        bool meter_fallback_ok = false;
+        bool meter_partial_ok = false;
+        if (!meter_ok && ocr_ok) {
+            meter_fallback_ok = extract_meter_fallback(ocr_word, meter_reading, sizeof(meter_reading));
+            if (!meter_fallback_ok) {
+                meter_partial_ok = extract_any_digits(ocr_word, meter_reading, sizeof(meter_reading));
+            }
+        }
+
+        if (s_ocr_mutex && xSemaphoreTake(s_ocr_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            if (meter_ok || meter_fallback_ok || meter_partial_ok) {
+                strncpy(s_last_meter_reading, meter_reading, sizeof(s_last_meter_reading) - 1);
+                s_last_meter_reading[sizeof(s_last_meter_reading) - 1] = '\0';
+                if (meter_ok) {
+                    s_last_meter_score = ocr_score;
+                } else if (meter_fallback_ok) {
+                    s_last_meter_score = ocr_score * 0.70f;
+                } else {
+                    s_last_meter_score = ocr_score * 0.55f;
+                }
+                s_last_meter_seq++;
+            }
+            xSemaphoreGive(s_ocr_mutex);
+        }
+
+        uint32_t jpeg_size = 0;
+        esp_err_t ret = app_image_encode_jpeg(camera_buf,
+                                              camera_buf_hes,
+                                              camera_buf_ves,
+                                              JPEG_QUALITY,
+                                              s_jpeg_buf,
+                                              s_jpeg_buf_size,
+                                              &jpeg_size);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "JPEG encode failed: %s", esp_err_to_name(ret));
+            return;
+        }
+
+        if (jpeg_size > MAX_MODEM_UPLOAD_JPEG_SIZE) {
+            uint32_t smaller_jpeg_size = 0;
+            esp_err_t smaller_ret = app_image_encode_jpeg(camera_buf,
+                                                          camera_buf_hes,
+                                                          camera_buf_ves,
+                                                          JPEG_QUALITY_FALLBACK,
+                                                          s_jpeg_buf,
+                                                          s_jpeg_buf_size,
+                                                          &smaller_jpeg_size);
+            if (smaller_ret == ESP_OK && smaller_jpeg_size > 0 && smaller_jpeg_size < jpeg_size) {
+                ESP_LOGW(TAG,
+                         "JPEG too large for EG91 (%lu bytes), re-encoded at quality %d -> %lu bytes",
+                         (unsigned long)jpeg_size,
+                         JPEG_QUALITY_FALLBACK,
+                         (unsigned long)smaller_jpeg_size);
+                jpeg_size = smaller_jpeg_size;
+            }
+        }
+
+        uint8_t *job_buf = heap_caps_malloc(jpeg_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!job_buf) {
+            ESP_LOGE(TAG, "failed to allocate upload job buffer (%lu bytes)", (unsigned long)jpeg_size);
+            if (force_capture) {
+                s_manual_upload_requested = true;
+                s_manual_retry_after_us = now_us + 200000;
+            }
+            return;
+        }
+        memcpy(job_buf, s_jpeg_buf, jpeg_size);
+
+        if (force_capture) {
+            ESP_LOGI(TAG, "Queue manual/boot captured image (%lu bytes)", (unsigned long)jpeg_size);
+            if (meter_ok) {
+                ESP_LOGI(TAG, "[ocr_snap] stage=%d roi=%d,%d,%d,%d word=%s score=%.2f", ocr_stage, roi_x0, roi_y0, roi_x1, roi_y1, ocr_word, ocr_score);
+                ESP_LOGI(TAG, "[ocr_meter] reading=%s", meter_reading);
+            } else if (meter_fallback_ok) {
+                ESP_LOGI(TAG, "[ocr_snap] stage=%d roi=%d,%d,%d,%d word=%s score=%.2f", ocr_stage, roi_x0, roi_y0, roi_x1, roi_y1, ocr_word, ocr_score);
+                ESP_LOGI(TAG, "[ocr_meter] fallback reading=%s", meter_reading);
+            } else if (meter_partial_ok) {
+                ESP_LOGI(TAG, "[ocr_snap] stage=%d roi=%d,%d,%d,%d word=%s score=%.2f", ocr_stage, roi_x0, roi_y0, roi_x1, roi_y1, ocr_word, ocr_score);
+                ESP_LOGI(TAG, "[ocr_meter] partial reading=%s", meter_reading);
+            } else if (ocr_ok) {
+                ESP_LOGI(TAG, "[ocr_snap] stage=%d roi=%d,%d,%d,%d word=%s score=%.2f", ocr_stage, roi_x0, roi_y0, roi_x1, roi_y1, ocr_word, ocr_score);
+                ESP_LOGI(TAG, "[ocr_meter] no reliable meter digits");
+            } else {
+                ESP_LOGI(TAG, "[ocr_snap] stage=%d roi=%d,%d,%d,%d no text detected", ocr_stage, roi_x0, roi_y0, roi_x1, roi_y1);
+            }
+            s_web_pause_until_us = now_us + 3000000; // prioritize immediate manual upload path
+        } else {
+            ESP_LOGI(TAG, "Queue periodic captured image (%lu bytes)", (unsigned long)jpeg_size);
+            if (meter_ok) {
+                ESP_LOGI(TAG, "[ocr_snap] stage=%d roi=%d,%d,%d,%d word=%s score=%.2f", ocr_stage, roi_x0, roi_y0, roi_x1, roi_y1, ocr_word, ocr_score);
+                ESP_LOGI(TAG, "[ocr_meter] reading=%s", meter_reading);
+            } else if (meter_fallback_ok) {
+                ESP_LOGI(TAG, "[ocr_snap] stage=%d roi=%d,%d,%d,%d word=%s score=%.2f", ocr_stage, roi_x0, roi_y0, roi_x1, roi_y1, ocr_word, ocr_score);
+                ESP_LOGI(TAG, "[ocr_meter] fallback reading=%s", meter_reading);
+            } else if (meter_partial_ok) {
+                ESP_LOGI(TAG, "[ocr_snap] stage=%d roi=%d,%d,%d,%d word=%s score=%.2f", ocr_stage, roi_x0, roi_y0, roi_x1, roi_y1, ocr_word, ocr_score);
+                ESP_LOGI(TAG, "[ocr_meter] partial reading=%s", meter_reading);
+            } else if (ocr_ok) {
+                ESP_LOGI(TAG, "[ocr_snap] stage=%d roi=%d,%d,%d,%d word=%s score=%.2f", ocr_stage, roi_x0, roi_y0, roi_x1, roi_y1, ocr_word, ocr_score);
+            }
+        }
+
+        const char *job_word = (meter_ok || meter_fallback_ok) ? meter_reading : "";
+        float job_score = meter_ok ? ocr_score : (meter_fallback_ok ? (ocr_score * 0.70f) : 0.0f);
+        if (!enqueue_upload_job(job_buf, jpeg_size, force_capture, job_word, job_score)) {
+            heap_caps_free(job_buf);
+            if (force_capture) {
+                ESP_LOGW(TAG, "upload queue busy; retrying manual snap shortly");
+                s_manual_upload_requested = true;
+                s_manual_retry_after_us = now_us + 200000;
+            }
+        }
+    }
+
+    if (!force_capture && s_web_rgb_buf && s_web_jpeg_buf && s_web_jpeg_mutex) {
+        if (now_us < s_web_pause_until_us) {
+            return;
+        }
+        if (s_upload_queue && uxQueueMessagesWaiting(s_upload_queue) > 0) {
+            return;
+        }
         if ((now_us - s_last_web_frame_us) >= WEB_FRAME_INTERVAL_US) {
             uint32_t crop_w = 960 / s_digital_zoom_level;
             uint32_t crop_h = 540 / s_digital_zoom_level;
@@ -361,68 +1335,6 @@ static void pushlog_camera_frame_cb(uint8_t *camera_buf,
             }
         }
     }
-
-    bool force_capture = false;
-    if (s_manual_upload_requested && now_us >= s_manual_retry_after_us) {
-        force_capture = true;
-        s_manual_upload_requested = false;
-    }
-
-    if (!force_capture && s_warmup_frames < CAMERA_WARMUP_FRAMES) {
-        s_warmup_frames++;
-        return;
-    }
-
-    if (!force_capture && !app_pushlog_should_capture_now()) {
-        return;
-    }
-
-    if (s_upload_in_progress) {
-        if (force_capture) {
-            s_manual_upload_requested = true;
-            s_manual_retry_after_us = now_us + 500000;
-        }
-        return;
-    }
-
-    s_upload_in_progress = true;
-
-    uint32_t jpeg_size = 0;
-    esp_err_t ret = app_image_encode_jpeg(camera_buf,
-                                          camera_buf_hes,
-                                          camera_buf_ves,
-                                          JPEG_QUALITY,
-                                          s_jpeg_buf,
-                                          s_jpeg_buf_size,
-                                          &jpeg_size);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "JPEG encode failed: %s", esp_err_to_name(ret));
-        s_upload_in_progress = false;
-        return;
-    }
-
-    if (force_capture) {
-        ESP_LOGI(TAG, "Uploading manual/boot captured image (%lu bytes)", (unsigned long)jpeg_size);
-    } else {
-        ESP_LOGI(TAG, "Uploading periodic captured image (%lu bytes)", (unsigned long)jpeg_size);
-    }
-    ret = app_pushlog_upload_jpeg(s_jpeg_buf, jpeg_size);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Pushlog upload failed: %s", esp_err_to_name(ret));
-        if (force_capture) {
-            // Re-queue manual/boot upload until Wi-Fi becomes ready.
-            s_manual_upload_requested = true;
-            s_manual_retry_after_us = esp_timer_get_time() + 1000000;
-        }
-    } else {
-        if (force_capture) {
-            ESP_LOGI(TAG, "Manual/boot Pushlog upload successful");
-        } else {
-            ESP_LOGI(TAG, "Periodic Pushlog upload successful");
-        }
-    }
-
-    s_upload_in_progress = false;
 }
 
 esp_err_t app_pushlog_camera_init(i2c_master_bus_handle_t i2c_handle)
@@ -465,6 +1377,11 @@ esp_err_t app_pushlog_camera_init(i2c_master_bus_handle_t i2c_handle)
     }
 
     s_web_jpeg_mutex = xSemaphoreCreateMutex();
+    s_ocr_mutex = xSemaphoreCreateMutex();
+    if (!s_ocr_mutex) {
+        ESP_LOGW(TAG, "failed to create OCR mutex; latest meter reading endpoint will be unstable");
+    }
+
     if (s_web_jpeg_mutex) {
         size_t align = s_cache_line_size ? s_cache_line_size : 32;
         s_web_rgb_buf = heap_caps_aligned_calloc(align, 1, WEB_RGB_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -497,7 +1414,16 @@ esp_err_t app_pushlog_camera_init(i2c_master_bus_handle_t i2c_handle)
     }
 
     init_web_cam_ctrls();
-    init_hw_controls();
+    ret = app_pushlog_ai_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "AI overlay init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    if (kEnableHwControls) {
+        init_hw_controls();
+    } else {
+        ESP_LOGW(TAG, "hardware button/knob controls disabled for stability");
+    }
 
     jpeg_encode_memory_alloc_cfg_t jpeg_mem_cfg = {
         .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER,
@@ -507,6 +1433,26 @@ esp_err_t app_pushlog_camera_init(i2c_master_bus_handle_t i2c_handle)
     s_jpeg_buf_size = jpeg_buf_size;
     if (s_jpeg_buf == NULL) {
         ESP_LOGE(TAG, "failed to allocate JPEG buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_upload_queue = xQueueCreate(UPLOAD_QUEUE_LEN, sizeof(upload_job_t));
+    if (!s_upload_queue) {
+        ESP_LOGE(TAG, "failed to create upload queue");
+        return ESP_ERR_NO_MEM;
+    }
+
+    BaseType_t task_ok = xTaskCreatePinnedToCore(
+        pushlog_upload_task,
+        "pushlog_upload",
+        8192,
+        NULL,
+        8,
+        &s_upload_task,
+        tskNO_AFFINITY
+    );
+    if (task_ok != pdPASS) {
+        ESP_LOGE(TAG, "failed to create upload task");
         return ESP_ERR_NO_MEM;
     }
 
@@ -538,6 +1484,7 @@ esp_err_t app_pushlog_camera_request_upload_now(void)
 
     s_manual_upload_requested = true;
     s_manual_retry_after_us = 0;
+    s_web_pause_until_us = esp_timer_get_time() + 3000000;
     return ESP_OK;
 }
 
@@ -566,6 +1513,76 @@ esp_err_t app_pushlog_camera_get_web_jpeg(uint8_t *out_buf, size_t out_buf_size,
 
     *out_size = len;
     return ESP_OK;
+}
+
+bool app_pushlog_camera_get_last_meter_reading(char *out_reading, size_t out_size, float *score)
+{
+    if (!out_reading || out_size < 2) {
+        return false;
+    }
+
+    out_reading[0] = '\0';
+    if (score) {
+        *score = 0.0f;
+    }
+
+    if (!s_ocr_mutex) {
+        return false;
+    }
+
+    if (xSemaphoreTake(s_ocr_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return false;
+    }
+
+    bool ok = (s_last_meter_reading[0] != '\0');
+    if (ok) {
+        strncpy(out_reading, s_last_meter_reading, out_size - 1);
+        out_reading[out_size - 1] = '\0';
+        if (score) {
+            *score = s_last_meter_score;
+        }
+    }
+
+    xSemaphoreGive(s_ocr_mutex);
+    return ok;
+}
+
+bool app_pushlog_camera_get_last_meter_snapshot(char *out_reading, size_t out_size, float *score, uint32_t *seq)
+{
+    if (!out_reading || out_size < 2) {
+        return false;
+    }
+
+    out_reading[0] = '\0';
+    if (score) {
+        *score = 0.0f;
+    }
+    if (seq) {
+        *seq = 0;
+    }
+
+    if (!s_ocr_mutex) {
+        return false;
+    }
+
+    if (xSemaphoreTake(s_ocr_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return false;
+    }
+
+    bool ok = (s_last_meter_reading[0] != '\0');
+    if (ok) {
+        strncpy(out_reading, s_last_meter_reading, out_size - 1);
+        out_reading[out_size - 1] = '\0';
+        if (score) {
+            *score = s_last_meter_score;
+        }
+    }
+    if (seq) {
+        *seq = s_last_meter_seq;
+    }
+
+    xSemaphoreGive(s_ocr_mutex);
+    return ok;
 }
 
 esp_err_t app_pushlog_camera_set_zoom(int32_t value)

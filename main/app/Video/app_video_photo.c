@@ -204,7 +204,7 @@ esp_err_t take_and_save_photo(uint8_t *camera_buf, uint32_t width, uint32_t heig
     }
 
     // Upload the picture to Pushlog
-    ret = app_pushlog_upload_jpeg(jpg_buf, jpg_size);
+    ret = app_pushlog_upload_jpeg(jpg_buf, jpg_size, NULL, 0.0f);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to upload picture: 0x%x", ret);
     } else {

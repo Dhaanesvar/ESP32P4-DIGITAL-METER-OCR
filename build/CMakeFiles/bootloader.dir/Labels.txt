@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/home/dhaanesvar/Desktop/ESP32P4 EYE/build/CMakeFiles/bootloader
+/home/dhaanesvar/Desktop/ESP32P4 EYE/build/CMakeFiles/bootloader.rule
+/home/dhaanesvar/Desktop/ESP32P4 EYE/build/CMakeFiles/bootloader-complete.rule
+/home/dhaanesvar/Desktop/ESP32P4 EYE/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/home/dhaanesvar/Desktop/ESP32P4 EYE/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/home/dhaanesvar/Desktop/ESP32P4 EYE/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/home/dhaanesvar/Desktop/ESP32P4 EYE/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/home/dhaanesvar/Desktop/ESP32P4 EYE/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/home/dhaanesvar/Desktop/ESP32P4 EYE/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/home/dhaanesvar/Desktop/ESP32P4 EYE/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule

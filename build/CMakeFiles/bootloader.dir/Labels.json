@@ -1,0 +1,43 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/dhaanesvar/Desktop/ESP32P4 EYE/build/CMakeFiles/bootloader"
+		},
+		{
+			"file" : "/home/dhaanesvar/Desktop/ESP32P4 EYE/build/CMakeFiles/bootloader.rule"
+		},
+		{
+			"file" : "/home/dhaanesvar/Desktop/ESP32P4 EYE/build/CMakeFiles/bootloader-complete.rule"
+		},
+		{
+			"file" : "/home/dhaanesvar/Desktop/ESP32P4 EYE/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule"
+		},
+		{
+			"file" : "/home/dhaanesvar/Desktop/ESP32P4 EYE/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule"
+		},
+		{
+			"file" : "/home/dhaanesvar/Desktop/ESP32P4 EYE/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule"
+		},
+		{
+			"file" : "/home/dhaanesvar/Desktop/ESP32P4 EYE/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule"
+		},
+		{
+			"file" : "/home/dhaanesvar/Desktop/ESP32P4 EYE/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule"
+		},
+		{
+			"file" : "/home/dhaanesvar/Desktop/ESP32P4 EYE/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule"
+		},
+		{
+			"file" : "/home/dhaanesvar/Desktop/ESP32P4 EYE/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"bootloader"
+		],
+		"name" : "bootloader"
+	}
+}

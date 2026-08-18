@@ -1,0 +1,2 @@
+source /home/dhaanesvar/Desktop/ESP32P4 EYE/build/gdbinit/symbols
+source /home/dhaanesvar/Desktop/ESP32P4 EYE/build/gdbinit/connect

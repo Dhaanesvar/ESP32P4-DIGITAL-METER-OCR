@@ -14,44 +14,163 @@ static const char *TAG = "pushlog_web";
 static uint8_t *s_frame_buf = NULL;
 static const size_t s_frame_buf_size = 220 * 1024;
 
-static httpd_handle_t s_httpd = NULL;
+static httpd_handle_t s_ctrl_httpd = NULL;
+static httpd_handle_t s_stream_httpd = NULL;
 
 static const char s_index_html[] =
 "<!doctype html>\n"
 "<html><head><meta charset=\"utf-8\">\n"
 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
-"<title>Pushlog Camera</title>\n"
+"<title>Pushlog Live Snap</title>\n"
 "<style>\n"
-":root{--bg:#0f1217;--panel:#1d222b;--text:#e9edf2;--muted:#9ca7b7;--accent:#f04d3f;}\n"
-"*{box-sizing:border-box;font-family:Verdana,sans-serif;}\n"
-"body{margin:0;min-height:100vh;background:radial-gradient(circle at 20% 0%,#1b2230 0%,var(--bg) 50%);color:var(--text);display:grid;place-items:center;padding:20px;}\n"
-".card{width:min(560px,100%);background:linear-gradient(180deg,#202735,var(--panel));border:1px solid #2f3746;border-radius:16px;padding:20px 20px 24px;box-shadow:0 20px 40px rgba(0,0,0,.35);}\n"
-"h1{margin:0 0 10px;font-size:26px;letter-spacing:.3px;}\n"
-"p{margin:0 0 16px;color:var(--muted);line-height:1.4;}\n"
-".btn{width:100%;padding:14px 16px;border:0;border-radius:12px;background:var(--accent);color:white;font-size:18px;font-weight:700;cursor:pointer;}\n"
-".btn:disabled{opacity:.6;cursor:not-allowed;}\n"
-".status{margin-top:14px;min-height:22px;font-weight:600;}\n"
-".ok{color:#73d13d;}.err{color:#ff7a7a;}.wait{color:#ffd166;}\n"
-".hint{margin-top:10px;font-size:13px;color:var(--muted);}\n"
+":root{--bg:#f6f7fb;--card:#ffffff;--ink:#111827;--muted:#5b6473;--line:#dfe4ee;--accent:#0f766e;--accent2:#164e63;--ok:#15803d;--bad:#b91c1c;}\n"
+"*{box-sizing:border-box}body{margin:0;background:radial-gradient(1100px 500px at 5% -10%,#d9f3ff 0%,transparent 60%),radial-gradient(1000px 500px at 100% 0%,#d8ffe7 0%,transparent 60%),var(--bg);font-family:'Trebuchet MS',Tahoma,sans-serif;color:var(--ink)}\n"
+".wrap{max-width:980px;margin:24px auto;padding:0 14px}.head{display:flex;justify-content:space-between;align-items:end;gap:10px}.title{font-size:30px;font-weight:800;letter-spacing:.2px}.sub{color:var(--muted);margin-top:6px}\n"
+".grid{display:grid;grid-template-columns:2fr 1fr;gap:14px;margin-top:14px}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:0 16px 32px rgba(15,23,42,.08);padding:12px}\n"
+".frame{position:relative;width:100%}.live{width:100%;aspect-ratio:16/9;border-radius:12px;border:1px solid #cfd6e6;background:#0b1020;object-fit:cover}.roi{position:absolute;left:32%;top:36%;width:36%;height:26%;border:3px solid #00d26a;border-radius:10px;box-shadow:0 0 0 2px rgba(0,0,0,.25) inset;pointer-events:none}.label{font-size:13px;color:var(--muted);margin:8px 2px 0}\n"
+".btns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}.btn{border:0;border-radius:12px;padding:13px 12px;font-size:15px;font-weight:800;cursor:pointer}.primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff}.secondary{background:#eef2ff;color:#1e293b;border:1px solid #d8e0fb}\n"
+".btn:disabled{opacity:.65;cursor:not-allowed}.status{margin-top:10px;min-height:22px;font-weight:700}.ok{color:var(--ok)}.err{color:var(--bad)}.wait{color:#a16207}\n"
+".snap{width:100%;aspect-ratio:4/3;border-radius:12px;border:1px solid #cfd6e6;background:#f1f5f9;object-fit:cover}.hint{margin-top:10px;font-size:13px;color:var(--muted);line-height:1.4}\n"
+"@media (max-width:900px){.grid{grid-template-columns:1fr}.title{font-size:24px}}\n"
 "</style></head>\n"
-"<body><div class=\"card\">\n"
-"<h1>Pushlog Camera</h1>\n"
-"<p>High-quality live view with manual Pushlog capture.</p>\n"
-"<img id=\"live\" style=\"width:100%;border-radius:12px;border:1px solid #30384a;background:#111;aspect-ratio:16/9;object-fit:cover;\" src=\"/stream\" alt=\"Live\">\n"
-"<div class=\"hint\">Live MJPEG stream endpoint: /stream (high quality, low fps)</div>\n"
-"<button id=\"snap\" class=\"btn\">Snap & Send to Pushlog</button>\n"
+"<body><div class=\"wrap\">\n"
+"<div class=\"head\"><div><div class=\"title\">Pushlog Camera Control</div><div class=\"sub\">Live stream + one-tap capture upload</div></div></div>\n"
+"<div class=\"grid\">\n"
+"<section class=\"card\">\n"
+"<div class=\"frame\"><img id=\"live\" class=\"live\" src=\"\" alt=\"Live stream\"><div class=\"roi\"></div></div>\n"
+"<div class=\"label\">Live stream endpoint: :81/stream</div>\n"
+"</section>\n"
+"<aside class=\"card\">\n"
+"<div class=\"frame\"><img id=\"snapPreview\" class=\"snap\" src=\"\" alt=\"Latest captured frame\"><div class=\"roi\"></div></div>\n"
+"<div class=\"label\">Latest captured frame preview</div>\n"
+"<div id=\"meter\" class=\"label\">Meter reading: --</div>\n"
+"<div class=\"btns\"><button id=\"zoomOut\" class=\"btn secondary\">Zoom -</button><button id=\"zoomIn\" class=\"btn secondary\">Zoom +</button></div>\n"
+"<div class=\"btns\"><button id=\"afOn\" class=\"btn secondary\">Autofocus ON</button><button id=\"afOff\" class=\"btn secondary\">Autofocus OFF</button></div>\n"
+"<div class=\"btns\"><button id=\"snap\" class=\"btn primary\">Snap & Send</button><button id=\"refresh\" class=\"btn secondary\">Refresh Live</button></div>\n"
 "<div id=\"status\" class=\"status\"></div>\n"
-"<div class=\"hint\">Tip: On device, use rotary knob for zoom/focus (button toggles mode). On reset, firmware also triggers one immediate upload.</div>\n"
-"</div>\n"
+"<div class=\"hint\">Use the on-device knob for zoom/focus. This page sends POST /snap and shows /jpg preview.</div>\n"
+"</aside>\n"
+"</div></div>\n"
 "<script>\n"
-"const b=document.getElementById('snap');const s=document.getElementById('status');\n"
-"b.onclick=async()=>{b.disabled=true;s.className='status wait';s.textContent='Queued capture...';\n"
-"try{const r=await fetch('/snap',{method:'POST'});const t=await r.text();\n"
-"if(r.ok){s.className='status ok';s.textContent=t||'Capture request accepted';}\n"
-"else{s.className='status err';s.textContent=t||'Capture request failed';}}\n"
-"catch(e){s.className='status err';s.textContent='Network error';}\n"
-"b.disabled=false;};\n"
+"const snapBtn=document.getElementById('snap');const refreshBtn=document.getElementById('refresh');const statusEl=document.getElementById('status');\n"
+"const zoomInBtn=document.getElementById('zoomIn');const zoomOutBtn=document.getElementById('zoomOut');\n"
+"const afOnBtn=document.getElementById('afOn');const afOffBtn=document.getElementById('afOff');\n"
+"const liveEl=document.getElementById('live');const snapEl=document.getElementById('snapPreview');\n"
+"const meterEl=document.getElementById('meter');\n"
+"const host=location.hostname;\n"
+"let liveFallbackTried=false;\n"
+"function setStatus(kind,msg){statusEl.className='status '+kind;statusEl.textContent=msg||'';}\n"
+"function setLive(){liveFallbackTried=false;liveEl.src='/stream?ts='+Date.now();}\n"
+"function setSnapPreview(){snapEl.src='/jpg?ts='+Date.now();}\n"
+"async function postCmd(path){const r=await fetch(path,{method:'POST'});const t=await r.text();if(!r.ok)throw new Error(t||'command failed');return t;}\n"
+"async function refreshMeter(){try{const r=await fetch('/ocr');if(!r.ok)return;const j=await r.json();if(j.ok){meterEl.textContent='Meter reading: '+j.reading+' (score '+j.score.toFixed(2)+')';}else{meterEl.textContent='Meter reading: --';}}catch(e){}}\n"
+"liveEl.onerror=()=>{if(!liveFallbackTried){liveFallbackTried=true;liveEl.src='http://'+host+':81/stream?ts='+Date.now();setStatus('wait','Trying fallback stream...');return;}setStatus('err','Live stream unavailable right now');};\n"
+"setLive();setSnapPreview();refreshMeter();setInterval(refreshMeter,2000);\n"
+"zoomInBtn.onclick=async()=>{try{const t=await postCmd('/zoom?dir=in');setStatus('ok',t||'Zoom updated');setTimeout(setSnapPreview,300);}catch(e){setStatus('err',e.message||'Zoom failed');}};\n"
+"zoomOutBtn.onclick=async()=>{try{const t=await postCmd('/zoom?dir=out');setStatus('ok',t||'Zoom updated');setTimeout(setSnapPreview,300);}catch(e){setStatus('err',e.message||'Zoom failed');}};\n"
+"afOnBtn.onclick=async()=>{try{const t=await postCmd('/autofocus?enable=1');setStatus('ok',t||'Autofocus enabled');}catch(e){setStatus('err',e.message||'Autofocus failed');}};\n"
+"afOffBtn.onclick=async()=>{try{const t=await postCmd('/autofocus?enable=0');setStatus('ok',t||'Autofocus disabled');}catch(e){setStatus('err',e.message||'Autofocus failed');}};\n"
+"refreshBtn.onclick=()=>{setStatus('wait','Refreshing live stream...');setLive();setTimeout(()=>{if(statusEl.className.indexOf('wait')>=0)setStatus('', '');},800);};\n"
+"snapBtn.onclick=async()=>{snapBtn.disabled=true;setStatus('wait','Capturing and extracting...');\n"
+"try{const r=await fetch('/snap',{method:'POST'});const j=await r.json();\n"
+"if(r.ok&&j.ok){if(j.reading){meterEl.textContent='Meter reading: '+j.reading+' (score '+Number(j.score||0).toFixed(2)+')';}setStatus('ok',j.message||'Capture queued');setTimeout(setSnapPreview,700);setTimeout(setSnapPreview,1500);}\n"
+"else{setStatus('err',(j&&j.message)||'Capture request failed');}}\n"
+"catch(e){setStatus('err','Network error while sending snap');}\n"
+"snapBtn.disabled=false;};\n"
 "</script></body></html>\n";
+
+static esp_err_t ocr_get_handler(httpd_req_t *req)
+{
+    char reading[32] = {0};
+    float score = 0.0f;
+    bool ok = app_pushlog_camera_get_last_meter_reading(reading, sizeof(reading), &score);
+
+    char json[128] = {0};
+    if (ok) {
+        snprintf(json, sizeof(json), "{\"ok\":true,\"reading\":\"%s\",\"score\":%.2f}", reading, score);
+    } else {
+        snprintf(json, sizeof(json), "{\"ok\":false}");
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    return httpd_resp_sendstr(req, json);
+}
+
+static esp_err_t zoom_post_handler(httpd_req_t *req)
+{
+    char query[64] = {0};
+    esp_err_t ret = httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (ret != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "missing query");
+    }
+
+    char dir[8] = {0};
+    if (httpd_query_key_value(query, "dir", dir, sizeof(dir)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "missing dir");
+    }
+
+    int32_t min = 0, max = 0, step = 1, cur = 0;
+    if (!app_pushlog_camera_get_zoom_range(&min, &max, &step, &cur)) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_sendstr(req, "zoom not supported");
+    }
+
+    int32_t delta = (step > 0) ? step : 1;
+    int32_t next = cur;
+    if (strcmp(dir, "in") == 0) {
+        next = cur + delta;
+    } else if (strcmp(dir, "out") == 0) {
+        next = cur - delta;
+    } else {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "dir must be in/out");
+    }
+
+    if (next < min) {
+        next = min;
+    }
+    if (next > max) {
+        next = max;
+    }
+
+    ret = app_pushlog_camera_set_zoom(next);
+    if (ret != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "zoom set failed");
+    }
+
+    char resp[64] = {0};
+    snprintf(resp, sizeof(resp), "zoom=%ld", (long)next);
+    return httpd_resp_sendstr(req, resp);
+}
+
+static esp_err_t autofocus_post_handler(httpd_req_t *req)
+{
+    char query[64] = {0};
+    esp_err_t ret = httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (ret != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "missing query");
+    }
+
+    char enable[8] = {0};
+    if (httpd_query_key_value(query, "enable", enable, sizeof(enable)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "missing enable");
+    }
+
+    bool af = (strcmp(enable, "1") == 0 || strcasecmp(enable, "true") == 0 || strcasecmp(enable, "on") == 0);
+    ret = app_pushlog_camera_set_autofocus(af);
+    if (ret != ESP_OK) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_sendstr(req, "autofocus not supported");
+    }
+
+    return httpd_resp_sendstr(req, af ? "autofocus=on" : "autofocus=off");
+}
 
 static esp_err_t index_get_handler(httpd_req_t *req)
 {
@@ -61,15 +180,55 @@ static esp_err_t index_get_handler(httpd_req_t *req)
 
 static esp_err_t snap_post_handler(httpd_req_t *req)
 {
+    char before_reading[32] = {0};
+    float before_score = 0.0f;
+    uint32_t before_seq = 0;
+    (void)app_pushlog_camera_get_last_meter_snapshot(before_reading, sizeof(before_reading), &before_score, &before_seq);
+
     esp_err_t ret = app_pushlog_camera_request_upload_now();
     if (ret != ESP_OK) {
         httpd_resp_set_status(req, "409 Conflict");
-        httpd_resp_set_type(req, "text/plain");
-        return httpd_resp_sendstr(req, "Camera not ready yet");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"message\":\"Camera not ready yet\"}");
     }
 
-    httpd_resp_set_type(req, "text/plain");
-    return httpd_resp_sendstr(req, "Capture queued, upload in progress shortly");
+    char reading[32] = {0};
+    float score = 0.0f;
+    uint32_t seq = before_seq;
+    bool got_reading = false;
+    bool fresh = false;
+
+    for (int i = 0; i < 30; ++i) {
+        got_reading = app_pushlog_camera_get_last_meter_snapshot(reading, sizeof(reading), &score, &seq);
+        if (got_reading && seq > before_seq) {
+            fresh = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (!got_reading) {
+        got_reading = app_pushlog_camera_get_last_meter_snapshot(reading, sizeof(reading), &score, &seq);
+    }
+
+    char json[192] = {0};
+    if (got_reading) {
+        snprintf(json,
+                 sizeof(json),
+                 "{\"ok\":true,\"reading\":\"%s\",\"score\":%.2f,\"fresh\":%s,\"message\":\"Captured%s\"}",
+                 reading,
+                 score,
+                 fresh ? "true" : "false",
+                 fresh ? " and extracted" : ", using latest extracted reading");
+    } else {
+        snprintf(json,
+                 sizeof(json),
+                 "{\"ok\":true,\"fresh\":false,\"message\":\"Captured, OCR not available yet\"}");
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    return httpd_resp_sendstr(req, json);
 }
 
 static esp_err_t jpg_get_handler(httpd_req_t *req)
@@ -114,7 +273,7 @@ static esp_err_t stream_get_handler(httpd_req_t *req)
         size_t out_size = 0;
         ret = app_pushlog_camera_get_web_jpeg(s_frame_buf, s_frame_buf_size, &out_size);
         if (ret != ESP_OK || out_size == 0) {
-            vTaskDelay(pdMS_TO_TICKS(15));
+            vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
 
@@ -129,7 +288,7 @@ static esp_err_t stream_get_handler(httpd_req_t *req)
             break;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(15));
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 
     return ESP_OK;
@@ -137,17 +296,28 @@ static esp_err_t stream_get_handler(httpd_req_t *req)
 
 esp_err_t app_pushlog_web_start(void)
 {
-    if (s_httpd != NULL) {
+    if (s_ctrl_httpd != NULL && s_stream_httpd != NULL) {
         return ESP_OK;
     }
 
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.server_port = 80;
-    config.ctrl_port = 32768;
+    httpd_config_t ctrl_config = HTTPD_DEFAULT_CONFIG();
+    ctrl_config.server_port = 80;
+    ctrl_config.ctrl_port = 32768;
 
-    esp_err_t ret = httpd_start(&s_httpd, &config);
+    httpd_config_t stream_config = HTTPD_DEFAULT_CONFIG();
+    stream_config.server_port = 81;
+    stream_config.ctrl_port = 32769;
+    stream_config.lru_purge_enable = true;
+
+    esp_err_t ret = httpd_start(&s_ctrl_httpd, &ctrl_config);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "httpd_start failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "control httpd_start failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = httpd_start(&s_stream_httpd, &stream_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "stream httpd_start failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
@@ -178,6 +348,27 @@ esp_err_t app_pushlog_web_start(void)
         .user_ctx = NULL,
     };
 
+    httpd_uri_t ocr_uri = {
+        .uri = "/ocr",
+        .method = HTTP_GET,
+        .handler = ocr_get_handler,
+        .user_ctx = NULL,
+    };
+
+    httpd_uri_t zoom_uri = {
+        .uri = "/zoom",
+        .method = HTTP_POST,
+        .handler = zoom_post_handler,
+        .user_ctx = NULL,
+    };
+
+    httpd_uri_t autofocus_uri = {
+        .uri = "/autofocus",
+        .method = HTTP_POST,
+        .handler = autofocus_post_handler,
+        .user_ctx = NULL,
+    };
+
     httpd_uri_t stream_uri = {
         .uri = "/stream",
         .method = HTTP_GET,
@@ -185,30 +376,60 @@ esp_err_t app_pushlog_web_start(void)
         .user_ctx = NULL,
     };
 
-    ret = httpd_register_uri_handler(s_httpd, &index_uri);
+    ret = httpd_register_uri_handler(s_ctrl_httpd, &index_uri);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "register index handler failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    ret = httpd_register_uri_handler(s_httpd, &snap_uri);
+    ret = httpd_register_uri_handler(s_ctrl_httpd, &snap_uri);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "register snap handler failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    ret = httpd_register_uri_handler(s_httpd, &jpg_uri);
+    ret = httpd_register_uri_handler(s_ctrl_httpd, &jpg_uri);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "register jpg handler failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    ret = httpd_register_uri_handler(s_httpd, &stream_uri);
+    ret = httpd_register_uri_handler(s_ctrl_httpd, &ocr_uri);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "register ocr handler failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = httpd_register_uri_handler(s_ctrl_httpd, &stream_uri);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "register control stream handler failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = httpd_register_uri_handler(s_ctrl_httpd, &zoom_uri);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "register zoom handler failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = httpd_register_uri_handler(s_ctrl_httpd, &autofocus_uri);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "register autofocus handler failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = httpd_register_uri_handler(s_stream_httpd, &stream_uri);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "register stream handler failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    ESP_LOGI(TAG, "Web UI started: GET / , GET /jpg , GET /stream , POST /snap");
+    ret = httpd_register_uri_handler(s_stream_httpd, &jpg_uri);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "register stream jpg handler failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "Web UI started: control on :80 (/,/snap,/jpg,/ocr,/zoom,/autofocus,/stream), stream on :81 (/stream,/jpg)");
     return ESP_OK;
 }

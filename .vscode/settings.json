@@ -1,0 +1,14 @@
+{
+  "idf.currentSetup": "/home/dhaanesvar/.espressif/v6.0.1/esp-idf",
+  "idf.port": "/dev/ttyACM0",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32p4"
+  },
+  "clangd.path": "/home/dhaanesvar/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=/home/dhaanesvar/Desktop/ESP32P4 EYE/build"
+  ],
+  "idf.flashType": "UART"
+}

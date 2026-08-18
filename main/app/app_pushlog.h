@@ -11,7 +11,10 @@ extern "C" {
 
 esp_err_t app_pushlog_init(void);
 bool app_pushlog_should_capture_now(void);
-esp_err_t app_pushlog_upload_jpeg(const uint8_t *jpeg_data, size_t jpeg_len);
+esp_err_t app_pushlog_upload_jpeg(const uint8_t *jpeg_data,
+								  size_t jpeg_len,
+								  const char *ocr_word,
+								  float ocr_score);
 
 #ifdef __cplusplus
 }

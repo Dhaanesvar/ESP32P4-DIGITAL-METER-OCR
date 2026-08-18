@@ -426,6 +426,13 @@ esp_err_t app_video_stream_init(i2c_master_bus_handle_t i2c_handle)
     }
     ESP_LOGI(TAG, "Allocated shared photo buffer: %lu bytes (%dx%d)", shared_photo_buf_size, SHARED_PHOTO_BUF_WIDTH, SHARED_PHOTO_BUF_HEIGHT);
 
+    // Initialize AI detection runtime (models, painter, and detection task).
+    ret = app_ai_detect_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize AI detection module: 0x%x", ret);
+        goto cleanup;
+    }
+
     // Initialize AI detection buffers
     ret = app_ai_detection_init_buffers(data_cache_line_size);
     if (ret != ESP_OK) {
@@ -601,8 +608,8 @@ static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf
         return;
     }
 
-    // Process frame for AI detection if we're on the AI detection page
-    if (camera_state.flags.is_initialized && ui_extra_get_current_page() == UI_PAGE_AI_DETECT) {
+    // Run AI overlay on all live frames so detection boxes are always visible.
+    if (camera_state.flags.is_initialized) {
         ret = app_ai_detection_process_frame(
             camera_buffer.canvas_buf[camera_buf_index],
             BSP_LCD_H_RES,

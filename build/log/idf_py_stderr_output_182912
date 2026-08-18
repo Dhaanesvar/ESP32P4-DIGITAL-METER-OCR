@@ -1,0 +1,21 @@
+Command: cmake -G Ninja -B /home/dhaanesvar/Desktop/ESP32P4 EYE/build -DPYTHON_DEPS_CHECKED=1 -DPYTHON=/home/dhaanesvar/.espressif/tools/python/v6.0.1/venv/bin/python3 -DESP_PLATFORM=1 -DIDF_TARGET=esp32p4 -DCCACHE_ENABLE=False /home/dhaanesvar/Desktop/ESP32P4 EYE
+Loading defaults file /home/dhaanesvar/Desktop/ESP32P4 EYE/sdkconfig.defaults...
+warning: unknown kconfig symbol 'FLASH_COCO_DETECT_YOLO11N_S8_V1' assigned to 'y' in /home/dhaanesvar/Desktop/ESP32P4 EYE/sdkconfig.defaults
+warning: unknown kconfig symbol 'FLASH_COCO_DETECT_YOLO11N_S8_V3' assigned to 'n' in /home/dhaanesvar/Desktop/ESP32P4 EYE/sdkconfig.defaults
+warning: unknown kconfig symbol 'ESP_PAINTER_BASIC_FONT_20' assigned to 'y' in /home/dhaanesvar/Desktop/ESP32P4 EYE/sdkconfig.defaults
+warning: unknown kconfig symbol 'ESP_PAINTER_BASIC_FONT_24' assigned to 'n' in /home/dhaanesvar/Desktop/ESP32P4 EYE/sdkconfig.defaults
+warning: unknown kconfig symbol 'TINYUSB_MSC_ENABLED' assigned to 'y' in /home/dhaanesvar/Desktop/ESP32P4 EYE/sdkconfig.defaults
+warning: unknown kconfig symbol 'TINYUSB_MSC_BUFSIZE' assigned to '4096' in /home/dhaanesvar/Desktop/ESP32P4 EYE/sdkconfig.defaults
+warning: unknown kconfig symbol 'LV_COLOR_16_SWAP' assigned to 'y' in /home/dhaanesvar/Desktop/ESP32P4 EYE/sdkconfig.defaults
+warning: unknown kconfig symbol 'LV_COLOR_SCREEN_TRANSP' assigned to 'y' in /home/dhaanesvar/Desktop/ESP32P4 EYE/sdkconfig.defaults
+warning: unknown kconfig symbol 'LV_MEM_CUSTOM' assigned to 'y' in /home/dhaanesvar/Desktop/ESP32P4 EYE/sdkconfig.defaults
+warning: unknown kconfig symbol 'LV_MEMCPY_MEMSET_STD' assigned to 'y' in /home/dhaanesvar/Desktop/ESP32P4 EYE/sdkconfig.defaults
+warning: unknown kconfig symbol 'LV_IMG_CACHE_DEF_SIZE' assigned to '5' in /home/dhaanesvar/Desktop/ESP32P4 EYE/sdkconfig.defaults
+Configuration Report               
+ ───────────────────────────────── 
+   Parser Version: 1               
+   Verbosity: default              
+   Defaults policy: sdkconfig      
+   Status: Finished successfully   
+                                   
+ ───────────────────────────────── 

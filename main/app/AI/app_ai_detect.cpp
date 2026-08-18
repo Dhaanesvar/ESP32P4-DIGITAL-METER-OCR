@@ -40,6 +40,8 @@ static HumanFaceDetect *hum_detect = NULL;
 static COCODetect *coco_od_detect = NULL;
 
 static std::list<dl::detect::result_t> detect_results;
+static uint32_t s_face_frames = 0;
+static uint32_t s_ped_frames = 0;
 
 /**
  * @brief Structure for managing AI detection buffers
@@ -224,7 +226,7 @@ void camera_dectect_task(void)
 {
     while (1) {        
         camera_pipeline_buffer_element *p = camera_pipeline_recv_element(feed_pipeline, portMAX_DELAY);
-        if (p && ui_extra_get_current_page() == UI_PAGE_AI_DETECT && ui_extra_is_ui_init()) {
+        if (p && ui_extra_is_ui_init()) {
             if (ui_extra_get_ai_detect_mode() == AI_DETECT_PEDESTRIAN) {
                 detect_results = app_pedestrian_detect((uint16_t *)p->buffer, DETECT_WIDTH, DETECT_HEIGHT);
             } else if (ui_extra_get_ai_detect_mode() == AI_DETECT_FACE) {
@@ -294,6 +296,8 @@ esp_err_t app_coco_od_detect(uint16_t *data, int width, int height)
 
 esp_err_t app_humanface_ai_detect(uint16_t *detect_buf, uint16_t *draw_buf, int width, int height)
 {
+    s_face_frames++;
+
     // Process input frame
     camera_pipeline_buffer_element *input_element = camera_pipeline_get_queued_element(feed_pipeline);
     if (input_element) {
@@ -305,6 +309,7 @@ esp_err_t app_humanface_ai_detect(uint16_t *detect_buf, uint16_t *draw_buf, int 
     camera_pipeline_buffer_element *detect_element = camera_pipeline_recv_element(detect_pipeline, 0);
     if (detect_element && detect_element->detect_results) {
         uint16_t *rgb_buf = draw_buf;
+        uint32_t det_count = 0;
         
         // Add safety check for detect_results pointer
         std::list<dl::detect::result_t> *results = detect_element->detect_results;
@@ -313,6 +318,7 @@ esp_err_t app_humanface_ai_detect(uint16_t *detect_buf, uint16_t *draw_buf, int 
                 const auto& box = res.box;
                 // Add additional safety checks
                 if (box.size() >= 4 && std::any_of(box.begin(), box.end(), [](int v) { return v != 0; })) {
+                    det_count++;
                     draw_rectangle_rgb(rgb_buf, width, height,
                                     box[0], box[1], box[2], box[3],
                                     0, 0, 255, 0, 0, 5, false);
@@ -325,6 +331,10 @@ esp_err_t app_humanface_ai_detect(uint16_t *detect_buf, uint16_t *draw_buf, int 
             }
         }
 
+        if ((s_face_frames % 30) == 0) {
+            ESP_LOGI(TAG, "[ai_detect] mode=face boxes=%u", (unsigned)det_count);
+        }
+
         camera_pipeline_queue_element_index(detect_pipeline, detect_element->index);
     }
 
@@ -333,6 +343,8 @@ esp_err_t app_humanface_ai_detect(uint16_t *detect_buf, uint16_t *draw_buf, int 
 
 esp_err_t app_pedestrian_ai_detect(uint16_t *detect_buf, uint16_t *draw_buf, int width, int height)
 {
+    s_ped_frames++;
+
     // Process input frame
     camera_pipeline_buffer_element *input_element = camera_pipeline_get_queued_element(feed_pipeline);
     if (input_element) {
@@ -344,6 +356,7 @@ esp_err_t app_pedestrian_ai_detect(uint16_t *detect_buf, uint16_t *draw_buf, int
     camera_pipeline_buffer_element *detect_element = camera_pipeline_recv_element(detect_pipeline, 0);
     if (detect_element && detect_element->detect_results) {
         uint16_t *rgb_buf = draw_buf;
+        uint32_t det_count = 0;
         
         // Add safety check for detect_results pointer
         std::list<dl::detect::result_t> *results = detect_element->detect_results;
@@ -352,11 +365,16 @@ esp_err_t app_pedestrian_ai_detect(uint16_t *detect_buf, uint16_t *draw_buf, int
                 const auto& box = res.box;
                 // Add additional safety checks
                 if (box.size() >= 4 && std::any_of(box.begin(), box.end(), [](int v) { return v != 0; })) {
+                    det_count++;
                     draw_rectangle_rgb(rgb_buf, width, height,
                                     box[0], box[1], box[2], box[3],
                                     0, 0, 255, 0, 0, 5, false);
                 }
             }
+        }
+
+        if ((s_ped_frames % 30) == 0) {
+            ESP_LOGI(TAG, "[ai_detect] mode=pedestrian boxes=%u", (unsigned)det_count);
         }
     
         camera_pipeline_queue_element_index(detect_pipeline, detect_element->index);
