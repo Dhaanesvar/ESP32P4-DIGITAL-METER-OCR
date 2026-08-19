@@ -390,45 +390,62 @@ bool app_pushlog_should_capture_now(void)
     return true;
 }
 
-static void app_pushlog_build_ocr_json(const char *ocr_word, float ocr_score, char *out_json, size_t out_size)
+static void sanitize_ocr_token(const char *src, char *dst, size_t dst_size)
+{
+    if (!dst || dst_size == 0) {
+        return;
+    }
+
+    dst[0] = '\0';
+    if (!src || src[0] == '\0') {
+        return;
+    }
+
+    size_t n = 0;
+    for (size_t i = 0; src[i] != '\0' && n < (dst_size - 1); ++i) {
+        char c = src[i];
+        if ((c >= '0' && c <= '9') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            c == '_' || c == '-' || c == '.') {
+            dst[n++] = c;
+        }
+    }
+    dst[n] = '\0';
+}
+
+static void app_pushlog_build_ocr_json(const char *ocr_word,
+                                       const char *meter_reading,
+                                       float ocr_score,
+                                       char *out_json,
+                                       size_t out_size)
 {
     if (!out_json || out_size < 3) {
         return;
     }
 
-    if (!ocr_word || ocr_word[0] == '\0') {
-        snprintf(out_json, out_size, "{}");
-        return;
-    }
+    char clean_word[40] = {0};
+    char clean_reading[40] = {0};
+    sanitize_ocr_token(ocr_word, clean_word, sizeof(clean_word));
+    sanitize_ocr_token(meter_reading, clean_reading, sizeof(clean_reading));
 
-    char clean_word[40];
-    size_t n = 0;
-    for (size_t i = 0; ocr_word[i] != '\0' && n < (sizeof(clean_word) - 1); ++i) {
-        char c = ocr_word[i];
-        if ((c >= '0' && c <= '9') ||
-            (c >= 'A' && c <= 'Z') ||
-            (c >= 'a' && c <= 'z') ||
-            c == '_' || c == '-') {
-            clean_word[n++] = c;
-        }
-    }
-    clean_word[n] = '\0';
-
-    if (clean_word[0] == '\0') {
+    if (clean_word[0] == '\0' && clean_reading[0] == '\0') {
         snprintf(out_json, out_size, "{}");
         return;
     }
 
     snprintf(out_json,
              out_size,
-             "{\"word\":\"%s\",\"score\":%.2f}",
+             "{\"word\":\"%s\",\"reading\":\"%s\",\"score\":%.2f}",
              clean_word,
+             clean_reading,
              (double)ocr_score);
 }
 
 esp_err_t app_pushlog_upload_jpeg(const uint8_t *jpeg_data,
                                   size_t jpeg_len,
                                   const char *ocr_word,
+                                  const char *meter_reading,
                                   float ocr_score)
 {
     if (!jpeg_data || jpeg_len == 0) {
@@ -439,9 +456,16 @@ esp_err_t app_pushlog_upload_jpeg(const uint8_t *jpeg_data,
     char url_http[192] = {0};
     char ocr_json[96] = {0};
 
-    app_pushlog_build_ocr_json(ocr_word, ocr_score, ocr_json, sizeof(ocr_json));
+    app_pushlog_build_ocr_json(ocr_word, meter_reading, ocr_score, ocr_json, sizeof(ocr_json));
     snprintf(url_https, sizeof(url_https), "%s", PUSHLOG_FIXED_URL_HTTPS);
     snprintf(url_http, sizeof(url_http), "%s", PUSHLOG_FIXED_URL_HTTP);
+
+    ESP_LOGI(TAG,
+             "OCR payload word=%s reading=%s score=%.2f json=%s",
+             (ocr_word && ocr_word[0] != '\0') ? ocr_word : "-",
+             (meter_reading && meter_reading[0] != '\0') ? meter_reading : "-",
+             (double)ocr_score,
+             ocr_json);
 
     app_pushlog_retry_wifi_if_needed();
     if (!s_wifi_connected) {

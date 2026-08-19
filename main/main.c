@@ -44,11 +44,17 @@ static bool s_eg91_uart_ready = false;
 static SemaphoreHandle_t s_eg91_uart_mutex = NULL;
 static bool s_eg91_last_uart_busy = false;
 
-static void eg91_log_test_box(const char *title, const char *const *cmds, const bool *results, size_t count)
+static void eg91_log_test_box(const char *title, const char *const *cmds, const int8_t *results, size_t count)
 {
     ESP_LOGI(TAG, "+-------------------- %s --------------------+", title);
     for (size_t i = 0; i < count; ++i) {
-        ESP_LOGI(TAG, "| %-12s : %-4s                         |", cmds[i], results[i] ? "PASS" : "FAIL");
+        const char *state = "N/A";
+        if (results[i] > 0) {
+            state = "PASS";
+        } else if (results[i] == 0) {
+            state = "FAIL";
+        }
+        ESP_LOGI(TAG, "| %-12s : %-4s                         |", cmds[i], state);
     }
     ESP_LOGI(TAG, "+----------------------------------------------------------+");
 }
@@ -433,7 +439,10 @@ static bool eg91_validate_response(const char *cmd, const char *resp)
     }
 
     if (strcmp(cmd, "ATI") == 0) {
-        return strstr(resp, "EG91") != NULL && strstr(resp, "OK") != NULL;
+        if (strstr(resp, "OK") == NULL) {
+            return false;
+        }
+        return strstr(resp, "EG91") != NULL || strstr(resp, "EG800") != NULL || strstr(resp, "Quectel") != NULL;
     }
 
     if (strcmp(cmd, "AT+CPIN?") == 0) {
@@ -482,7 +491,8 @@ static bool eg91_run_health_check_once(void)
         "AT+CREG?",
     };
     char resp[512];
-    bool results[sizeof(cmds) / sizeof(cmds[0])] = {false};
+    int8_t results[sizeof(cmds) / sizeof(cmds[0])];
+    memset(results, -1, sizeof(results));
     bool all_ok = true;
 
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
@@ -492,14 +502,14 @@ static bool eg91_run_health_check_once(void)
                 ESP_LOGW(TAG, "EG91 health check deferred: UART busy");
                 return true;
             }
-            results[i] = false;
+            results[i] = 0;
             all_ok = false;
             eg91_log_test_box("AT TESTS", cmds, results, sizeof(cmds) / sizeof(cmds[0]));
             ESP_LOGE(TAG, "EG91 health check no response on %s", cmds[i]);
             return false;
         }
         bool ok = eg91_validate_response(cmds[i], resp);
-        results[i] = ok;
+        results[i] = ok ? 1 : 0;
         if (!ok) {
             all_ok = false;
             eg91_log_test_box("AT TESTS", cmds, results, sizeof(cmds) / sizeof(cmds[0]));

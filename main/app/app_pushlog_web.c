@@ -43,7 +43,10 @@ static const char s_index_html[] =
 "<aside class=\"card\">\n"
 "<div class=\"frame\"><img id=\"snapPreview\" class=\"snap\" src=\"\" alt=\"Latest captured frame\"><div class=\"roi\"></div></div>\n"
 "<div class=\"label\">Latest captured frame preview</div>\n"
+"<div id=\"ocrWord\" class=\"label\">OCR word: --</div>\n"
 "<div id=\"meter\" class=\"label\">Meter reading: --</div>\n"
+"<div class=\"btns\"><button id=\"expDown\" class=\"btn secondary\">Darker</button><button id=\"expUp\" class=\"btn secondary\">Brighter</button></div>\n"
+"<div class=\"btns\"><button id=\"expAuto\" class=\"btn secondary\">Auto Exposure</button><button id=\"expManual\" class=\"btn secondary\">Manual Exposure</button></div>\n"
 "<div class=\"btns\"><button id=\"zoomOut\" class=\"btn secondary\">Zoom -</button><button id=\"zoomIn\" class=\"btn secondary\">Zoom +</button></div>\n"
 "<div class=\"btns\"><button id=\"afOn\" class=\"btn secondary\">Autofocus ON</button><button id=\"afOff\" class=\"btn secondary\">Autofocus OFF</button></div>\n"
 "<div class=\"btns\"><button id=\"snap\" class=\"btn primary\">Snap & Send</button><button id=\"refresh\" class=\"btn secondary\">Refresh Live</button></div>\n"
@@ -54,8 +57,11 @@ static const char s_index_html[] =
 "<script>\n"
 "const snapBtn=document.getElementById('snap');const refreshBtn=document.getElementById('refresh');const statusEl=document.getElementById('status');\n"
 "const zoomInBtn=document.getElementById('zoomIn');const zoomOutBtn=document.getElementById('zoomOut');\n"
+"const expDownBtn=document.getElementById('expDown');const expUpBtn=document.getElementById('expUp');\n"
+"const expAutoBtn=document.getElementById('expAuto');const expManualBtn=document.getElementById('expManual');\n"
 "const afOnBtn=document.getElementById('afOn');const afOffBtn=document.getElementById('afOff');\n"
 "const liveEl=document.getElementById('live');const snapEl=document.getElementById('snapPreview');\n"
+"const ocrWordEl=document.getElementById('ocrWord');\n"
 "const meterEl=document.getElementById('meter');\n"
 "const host=location.hostname;\n"
 "let liveFallbackTried=false;\n"
@@ -63,17 +69,21 @@ static const char s_index_html[] =
 "function setLive(){liveFallbackTried=false;liveEl.src='/stream?ts='+Date.now();}\n"
 "function setSnapPreview(){snapEl.src='/jpg?ts='+Date.now();}\n"
 "async function postCmd(path){const r=await fetch(path,{method:'POST'});const t=await r.text();if(!r.ok)throw new Error(t||'command failed');return t;}\n"
-"async function refreshMeter(){try{const r=await fetch('/ocr');if(!r.ok)return;const j=await r.json();if(j.ok){meterEl.textContent='Meter reading: '+j.reading+' (score '+j.score.toFixed(2)+')';}else{meterEl.textContent='Meter reading: --';}}catch(e){}}\n"
+"async function refreshMeter(){try{const r=await fetch('/ocr');if(!r.ok)return;const j=await r.json();if(j.ok){ocrWordEl.textContent='OCR word: '+(j.word||'--');meterEl.textContent='Meter reading: '+(j.reading||'--')+' (score '+Number(j.score||0).toFixed(2)+')';}else{ocrWordEl.textContent='OCR word: --';meterEl.textContent='Meter reading: --';}}catch(e){}}\n"
 "liveEl.onerror=()=>{if(!liveFallbackTried){liveFallbackTried=true;liveEl.src='http://'+host+':81/stream?ts='+Date.now();setStatus('wait','Trying fallback stream...');return;}setStatus('err','Live stream unavailable right now');};\n"
 "setLive();setSnapPreview();refreshMeter();setInterval(refreshMeter,2000);\n"
 "zoomInBtn.onclick=async()=>{try{const t=await postCmd('/zoom?dir=in');setStatus('ok',t||'Zoom updated');setTimeout(setSnapPreview,300);}catch(e){setStatus('err',e.message||'Zoom failed');}};\n"
 "zoomOutBtn.onclick=async()=>{try{const t=await postCmd('/zoom?dir=out');setStatus('ok',t||'Zoom updated');setTimeout(setSnapPreview,300);}catch(e){setStatus('err',e.message||'Zoom failed');}};\n"
+"expDownBtn.onclick=async()=>{try{const t=await postCmd('/exposure?dir=down');setStatus('ok',t||'Exposure updated');setTimeout(setSnapPreview,300);}catch(e){setStatus('err',e.message||'Exposure failed');}};\n"
+"expUpBtn.onclick=async()=>{try{const t=await postCmd('/exposure?dir=up');setStatus('ok',t||'Exposure updated');setTimeout(setSnapPreview,300);}catch(e){setStatus('err',e.message||'Exposure failed');}};\n"
+"expAutoBtn.onclick=async()=>{try{const t=await postCmd('/exposure_auto?enable=1');setStatus('ok',t||'Auto exposure enabled');setTimeout(setSnapPreview,300);}catch(e){setStatus('err',e.message||'Auto exposure failed');}};\n"
+"expManualBtn.onclick=async()=>{try{const t=await postCmd('/exposure_auto?enable=0');setStatus('ok',t||'Manual exposure enabled');setTimeout(setSnapPreview,300);}catch(e){setStatus('err',e.message||'Manual exposure failed');}};\n"
 "afOnBtn.onclick=async()=>{try{const t=await postCmd('/autofocus?enable=1');setStatus('ok',t||'Autofocus enabled');}catch(e){setStatus('err',e.message||'Autofocus failed');}};\n"
 "afOffBtn.onclick=async()=>{try{const t=await postCmd('/autofocus?enable=0');setStatus('ok',t||'Autofocus disabled');}catch(e){setStatus('err',e.message||'Autofocus failed');}};\n"
 "refreshBtn.onclick=()=>{setStatus('wait','Refreshing live stream...');setLive();setTimeout(()=>{if(statusEl.className.indexOf('wait')>=0)setStatus('', '');},800);};\n"
 "snapBtn.onclick=async()=>{snapBtn.disabled=true;setStatus('wait','Capturing and extracting...');\n"
 "try{const r=await fetch('/snap',{method:'POST'});const j=await r.json();\n"
-"if(r.ok&&j.ok){if(j.reading){meterEl.textContent='Meter reading: '+j.reading+' (score '+Number(j.score||0).toFixed(2)+')';}setStatus('ok',j.message||'Capture queued');setTimeout(setSnapPreview,700);setTimeout(setSnapPreview,1500);}\n"
+"if(r.ok&&j.ok){ocrWordEl.textContent='OCR word: '+(j.word||'--');if(j.reading){meterEl.textContent='Meter reading: '+j.reading+' (score '+Number(j.score||0).toFixed(2)+')';}setStatus('ok',j.message||'Capture queued');setTimeout(setSnapPreview,700);setTimeout(setSnapPreview,1500);}\n"
 "else{setStatus('err',(j&&j.message)||'Capture request failed');}}\n"
 "catch(e){setStatus('err','Network error while sending snap');}\n"
 "snapBtn.disabled=false;};\n"
@@ -81,13 +91,26 @@ static const char s_index_html[] =
 
 static esp_err_t ocr_get_handler(httpd_req_t *req)
 {
+    char word[32] = {0};
     char reading[32] = {0};
     float score = 0.0f;
-    bool ok = app_pushlog_camera_get_last_meter_reading(reading, sizeof(reading), &score);
+    uint32_t seq = 0;
+    bool ok = app_pushlog_camera_get_last_ocr_snapshot(word,
+                                                        sizeof(word),
+                                                        reading,
+                                                        sizeof(reading),
+                                                        &score,
+                                                        &seq);
 
-    char json[128] = {0};
+    char json[192] = {0};
     if (ok) {
-        snprintf(json, sizeof(json), "{\"ok\":true,\"reading\":\"%s\",\"score\":%.2f}", reading, score);
+        snprintf(json,
+                 sizeof(json),
+                 "{\"ok\":true,\"word\":\"%s\",\"reading\":\"%s\",\"score\":%.2f,\"seq\":%lu}",
+                 word,
+                 reading,
+                 score,
+                 (unsigned long)seq);
     } else {
         snprintf(json, sizeof(json), "{\"ok\":false}");
     }
@@ -172,6 +195,81 @@ static esp_err_t autofocus_post_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, af ? "autofocus=on" : "autofocus=off");
 }
 
+static esp_err_t exposure_post_handler(httpd_req_t *req)
+{
+    char query[64] = {0};
+    esp_err_t ret = httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (ret != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "missing query");
+    }
+
+    char dir[8] = {0};
+    if (httpd_query_key_value(query, "dir", dir, sizeof(dir)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "missing dir");
+    }
+
+    int32_t min = 0, max = 0, step = 1, cur = 0;
+    if (!app_pushlog_camera_get_exposure_range(&min, &max, &step, &cur)) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_sendstr(req, "exposure not supported");
+    }
+
+    int32_t delta = (step > 0) ? step : 1;
+    int32_t next = cur;
+    if (strcmp(dir, "up") == 0) {
+        next = cur + delta;
+    } else if (strcmp(dir, "down") == 0) {
+        next = cur - delta;
+    } else {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "dir must be up/down");
+    }
+
+    if (next < min) {
+        next = min;
+    }
+    if (next > max) {
+        next = max;
+    }
+
+    ret = app_pushlog_camera_set_exposure(next);
+    if (ret != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "exposure set failed");
+    }
+
+    char resp[80] = {0};
+    snprintf(resp, sizeof(resp), "exposure=%ld", (long)next);
+    return httpd_resp_sendstr(req, resp);
+}
+
+static esp_err_t exposure_auto_post_handler(httpd_req_t *req)
+{
+    char query[64] = {0};
+    esp_err_t ret = httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (ret != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "missing query");
+    }
+
+    char enable[8] = {0};
+    if (httpd_query_key_value(query, "enable", enable, sizeof(enable)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "missing enable");
+    }
+
+    bool ae = (strcmp(enable, "1") == 0 || strcasecmp(enable, "true") == 0 || strcasecmp(enable, "on") == 0);
+    ret = app_pushlog_camera_set_auto_exposure(ae);
+    if (ret != ESP_OK) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_sendstr(req, "auto exposure not supported");
+    }
+
+    return httpd_resp_sendstr(req, ae ? "auto_exposure=on" : "auto_exposure=off");
+}
+
 static esp_err_t index_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
@@ -180,10 +278,16 @@ static esp_err_t index_get_handler(httpd_req_t *req)
 
 static esp_err_t snap_post_handler(httpd_req_t *req)
 {
+    char before_word[32] = {0};
     char before_reading[32] = {0};
     float before_score = 0.0f;
     uint32_t before_seq = 0;
-    (void)app_pushlog_camera_get_last_meter_snapshot(before_reading, sizeof(before_reading), &before_score, &before_seq);
+    (void)app_pushlog_camera_get_last_ocr_snapshot(before_word,
+                                                   sizeof(before_word),
+                                                   before_reading,
+                                                   sizeof(before_reading),
+                                                   &before_score,
+                                                   &before_seq);
 
     esp_err_t ret = app_pushlog_camera_request_upload_now();
     if (ret != ESP_OK) {
@@ -192,30 +296,42 @@ static esp_err_t snap_post_handler(httpd_req_t *req)
         return httpd_resp_sendstr(req, "{\"ok\":false,\"message\":\"Camera not ready yet\"}");
     }
 
+    char word[32] = {0};
     char reading[32] = {0};
     float score = 0.0f;
     uint32_t seq = before_seq;
-    bool got_reading = false;
+    bool got_ocr = false;
     bool fresh = false;
 
     for (int i = 0; i < 30; ++i) {
-        got_reading = app_pushlog_camera_get_last_meter_snapshot(reading, sizeof(reading), &score, &seq);
-        if (got_reading && seq > before_seq) {
+        got_ocr = app_pushlog_camera_get_last_ocr_snapshot(word,
+                                                           sizeof(word),
+                                                           reading,
+                                                           sizeof(reading),
+                                                           &score,
+                                                           &seq);
+        if (got_ocr && seq > before_seq) {
             fresh = true;
             break;
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    if (!got_reading) {
-        got_reading = app_pushlog_camera_get_last_meter_snapshot(reading, sizeof(reading), &score, &seq);
+    if (!got_ocr) {
+        got_ocr = app_pushlog_camera_get_last_ocr_snapshot(word,
+                                                            sizeof(word),
+                                                            reading,
+                                                            sizeof(reading),
+                                                            &score,
+                                                            &seq);
     }
 
-    char json[192] = {0};
-    if (got_reading) {
+    char json[256] = {0};
+    if (got_ocr) {
         snprintf(json,
                  sizeof(json),
-                 "{\"ok\":true,\"reading\":\"%s\",\"score\":%.2f,\"fresh\":%s,\"message\":\"Captured%s\"}",
+                 "{\"ok\":true,\"word\":\"%s\",\"reading\":\"%s\",\"score\":%.2f,\"fresh\":%s,\"message\":\"Captured%s\"}",
+                 word,
                  reading,
                  score,
                  fresh ? "true" : "false",
@@ -369,6 +485,20 @@ esp_err_t app_pushlog_web_start(void)
         .user_ctx = NULL,
     };
 
+    httpd_uri_t exposure_uri = {
+        .uri = "/exposure",
+        .method = HTTP_POST,
+        .handler = exposure_post_handler,
+        .user_ctx = NULL,
+    };
+
+    httpd_uri_t exposure_auto_uri = {
+        .uri = "/exposure_auto",
+        .method = HTTP_POST,
+        .handler = exposure_auto_post_handler,
+        .user_ctx = NULL,
+    };
+
     httpd_uri_t stream_uri = {
         .uri = "/stream",
         .method = HTTP_GET,
@@ -418,6 +548,18 @@ esp_err_t app_pushlog_web_start(void)
         return ret;
     }
 
+    ret = httpd_register_uri_handler(s_ctrl_httpd, &exposure_uri);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "register exposure handler failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = httpd_register_uri_handler(s_ctrl_httpd, &exposure_auto_uri);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "register exposure_auto handler failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
     ret = httpd_register_uri_handler(s_stream_httpd, &stream_uri);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "register stream handler failed: %s", esp_err_to_name(ret));
@@ -430,6 +572,6 @@ esp_err_t app_pushlog_web_start(void)
         return ret;
     }
 
-    ESP_LOGI(TAG, "Web UI started: control on :80 (/,/snap,/jpg,/ocr,/zoom,/autofocus,/stream), stream on :81 (/stream,/jpg)");
+    ESP_LOGI(TAG, "Web UI started: control on :80 (/,/snap,/jpg,/ocr,/zoom,/autofocus,/exposure,/exposure_auto,/stream), stream on :81 (/stream,/jpg)");
     return ESP_OK;
 }
