@@ -77,6 +77,11 @@ static const char *TAG = "app_pushlog";
 #define WIFI_SSID "Cre8IOT_2.4G"
 #define WIFI_PASS "A2240624@2024"
 
+#define WIFI_SOFTAP_SSID "ESP32P4-EYE"
+#define WIFI_SOFTAP_PASS "A2240624"
+#define WIFI_SOFTAP_CHANNEL 6
+#define WIFI_SOFTAP_MAX_CONN 4
+
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_num;
 static bool s_wifi_connected;
@@ -84,12 +89,88 @@ static int64_t s_next_capture_us;
 static int64_t s_next_wifi_init_retry_us;
 static bool s_wifi_handlers_registered;
 static bool s_wifi_netif_created;
+static bool s_wifi_ap_netif_created;
 static bool s_wifi_started;
 static esp_event_handler_instance_t s_wifi_event_instance;
 static esp_event_handler_instance_t s_ip_event_instance;
 
 static esp_err_t app_pushlog_try_start_wifi(bool wait_for_ip);
 static void app_pushlog_retry_wifi_if_needed(void);
+
+static esp_err_t app_pushlog_start_softap(void)
+{
+    esp_err_t ret = esp_netif_init();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_netif_init failed for SoftAP: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = esp_event_loop_create_default();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "event loop create failed for SoftAP: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    if (!s_wifi_ap_netif_created) {
+        if (esp_netif_create_default_wifi_ap() == NULL) {
+            ESP_LOGE(TAG, "failed to create default SoftAP netif");
+            return ESP_FAIL;
+        }
+        s_wifi_ap_netif_created = true;
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ret = esp_wifi_init(&cfg);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_wifi_init failed for SoftAP: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    wifi_config_t ap_config = { 0 };
+    snprintf((char *)ap_config.ap.ssid, sizeof(ap_config.ap.ssid), "%s", WIFI_SOFTAP_SSID);
+    snprintf((char *)ap_config.ap.password, sizeof(ap_config.ap.password), "%s", WIFI_SOFTAP_PASS);
+    ap_config.ap.ssid_len = strlen(WIFI_SOFTAP_SSID);
+    ap_config.ap.channel = WIFI_SOFTAP_CHANNEL;
+    ap_config.ap.max_connection = WIFI_SOFTAP_MAX_CONN;
+    ap_config.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+    ap_config.ap.pmf_cfg.required = false;
+
+    if (strlen(WIFI_SOFTAP_PASS) == 0) {
+        ap_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    ret = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_mode(AP) failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_config(AP) failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = esp_wifi_start();
+    if (ret != ESP_OK && ret != ESP_ERR_WIFI_CONN) {
+        ESP_LOGE(TAG, "esp_wifi_start(AP) failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap_netif) {
+        esp_netif_ip_info_t ip_info = { 0 };
+        if (esp_netif_get_ip_info(ap_netif, &ip_info) == ESP_OK) {
+            ESP_LOGI(TAG,
+                     "SoftAP ready SSID=%s PASS=%s IP=" IPSTR,
+                     WIFI_SOFTAP_SSID,
+                     WIFI_SOFTAP_PASS,
+                     IP2STR(&ip_info.ip));
+        }
+    }
+
+    return ESP_OK;
+}
 
 static esp_err_t app_pushlog_upload_via_wifi(const char *url_https,
                                              const char *url_http,
@@ -354,15 +435,15 @@ esp_err_t app_pushlog_init(void)
         return ret;
     }
 
-    ESP_LOGI(TAG, "Pushlog running in STA mode (temporary)");
+    ESP_LOGI(TAG, "Pushlog running in SIM modem mode");
     s_wifi_connected = false;
     s_wifi_started = false;
     s_next_wifi_init_retry_us = 0;
 
-    ret = app_pushlog_try_start_wifi(true);
+    // Keep SIM modem path for upload, while bringing up SoftAP for local PC web stream access.
+    ret = app_pushlog_start_softap();
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "STA init failed at startup: %s", esp_err_to_name(ret));
-        s_next_wifi_init_retry_us = esp_timer_get_time() + WIFI_INIT_RETRY_INTERVAL_US;
+        ESP_LOGW(TAG, "SoftAP init failed: %s", esp_err_to_name(ret));
     }
 
     // Allow the first periodic check to run immediately after boot.
@@ -467,21 +548,32 @@ esp_err_t app_pushlog_upload_jpeg(const uint8_t *jpeg_data,
              (double)ocr_score,
              ocr_json);
 
-    app_pushlog_retry_wifi_if_needed();
-    if (!s_wifi_connected) {
-        ESP_LOGW(TAG, "STA not connected; skipping upload until Wi-Fi is up");
+    if (!app_eg91_modem_is_ready()) {
+        ESP_LOGW(TAG, "EG91 modem not ready; skipping upload");
         return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGI(TAG, "Pushlog upload via STA (temporary)");
-    esp_err_t sta_ret = app_pushlog_upload_via_wifi(url_https,
-                                                    url_http,
-                                                    jpeg_data,
-                                                    jpeg_len,
-                                                    ocr_json);
-    if (sta_ret == ESP_OK) {
+    int http_status = 0;
+    ESP_LOGI(TAG, "Pushlog upload via SIM modem");
+    esp_err_t sim_ret = app_eg91_modem_http_post_jpeg(url_https,
+                                                      jpeg_data,
+                                                      jpeg_len,
+                                                      ocr_json,
+                                                      &http_status);
+    if (sim_ret == ESP_OK) {
         return ESP_OK;
     }
-    ESP_LOGE(TAG, "Pushlog STA upload failed: %s", esp_err_to_name(sta_ret));
-    return sta_ret;
+
+    ESP_LOGW(TAG, "SIM HTTPS upload failed (status=%d): %s, retrying HTTP", http_status, esp_err_to_name(sim_ret));
+    sim_ret = app_eg91_modem_http_post_jpeg(url_http,
+                                            jpeg_data,
+                                            jpeg_len,
+                                            ocr_json,
+                                            &http_status);
+    if (sim_ret == ESP_OK) {
+        return ESP_OK;
+    }
+
+    ESP_LOGE(TAG, "Pushlog SIM upload failed (status=%d): %s", http_status, esp_err_to_name(sim_ret));
+    return sim_ret;
 }

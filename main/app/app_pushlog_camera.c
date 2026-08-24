@@ -75,8 +75,25 @@ static int64_t s_web_pause_until_us = 0;
 static QueueHandle_t s_upload_queue = NULL;
 static TaskHandle_t s_upload_task = NULL;
 static SemaphoreHandle_t s_ocr_mutex = NULL;
+static lv_obj_t *s_live_pred_label = NULL;
 static char s_last_ocr_word[32] = {0};
 static char s_last_meter_reading[32] = {0};
+static char s_host_live_pred[32] = {0};
+static int64_t s_host_live_pred_until_us = 0;
+static bool s_host_bridge_active = false;
+
+#define HOST_BOX_MAX 12
+typedef struct {
+    int x0p;
+    int y0p;
+    int x1p;
+    int y1p;
+    char label[8];
+} host_box_t;
+
+static host_box_t s_host_boxes[HOST_BOX_MAX] = {0};
+static size_t s_host_box_count = 0;
+static int64_t s_host_boxes_until_us = 0;
 static float s_last_meter_score = 0.0f;
 static uint32_t s_last_ocr_seq = 0;
 static volatile bool s_last_digit_box_valid = false;
@@ -373,6 +390,25 @@ static bool extract_any_digits(const char *ocr_word, char *out_reading, size_t o
     return n > 0;
 }
 
+static void update_live_prediction_label_locked(const char *ocr_text)
+{
+    if (s_live_pred_label == NULL) {
+        s_live_pred_label = lv_label_create(lv_scr_act());
+        lv_obj_set_style_text_font(s_live_pred_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(s_live_pred_label, lv_color_hex(0x00FF00), 0);
+        lv_obj_set_style_bg_color(s_live_pred_label, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(s_live_pred_label, LV_OPA_50, 0);
+        lv_obj_set_style_pad_all(s_live_pred_label, 4, 0);
+        lv_obj_align(s_live_pred_label, LV_ALIGN_TOP_LEFT, 8, 8);
+    }
+
+    if (ocr_text && ocr_text[0] != '\0') {
+        lv_label_set_text_fmt(s_live_pred_label, "OCR: %s", ocr_text);
+    } else {
+        lv_label_set_text(s_live_pred_label, "OCR: host waiting...");
+    }
+}
+
 static void get_ocr_roi(int width, int height, int *x0, int *x1, int *y0, int *y1)
 {
     int rx0 = (width * OCR_ROI_X0_PCT) / 100;
@@ -512,6 +548,42 @@ static void draw_ocr_roi_box(uint16_t *buf, int width, int height)
                     }
                 }
             }
+        }
+    }
+}
+
+static void draw_host_boxes(uint16_t *buf, int width, int height, int64_t now_us)
+{
+    if (!buf || width <= 0 || height <= 0) {
+        return;
+    }
+    if (s_host_box_count == 0 || now_us >= s_host_boxes_until_us) {
+        return;
+    }
+
+    const uint16_t cyan = 0x07FF;
+    for (size_t i = 0; i < s_host_box_count; ++i) {
+        const host_box_t *b = &s_host_boxes[i];
+        int x0 = (b->x0p * width) / 100;
+        int y0 = (b->y0p * height) / 100;
+        int x1 = (b->x1p * width) / 100;
+        int y1 = (b->y1p * height) / 100;
+
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 >= width) x1 = width - 1;
+        if (y1 >= height) y1 = height - 1;
+        if (x1 <= x0 || y1 <= y0) {
+            continue;
+        }
+
+        for (int x = x0; x <= x1; ++x) {
+            buf[y0 * width + x] = cyan;
+            buf[y1 * width + x] = cyan;
+        }
+        for (int y = y0; y <= y1; ++y) {
+            buf[y * width + x0] = cyan;
+            buf[y * width + x1] = cyan;
         }
     }
 }
@@ -1176,8 +1248,36 @@ static void pushlog_camera_frame_cb(uint8_t *camera_buf,
             bool face_mode = (s_knob_mode == KNOB_CTRL_FOCUS);
             app_pushlog_ai_overlay((uint16_t *)s_preview_buf, BSP_LCD_H_RES, BSP_LCD_V_RES, face_mode);
             draw_ocr_roi_box((uint16_t *)s_preview_buf, BSP_LCD_H_RES, BSP_LCD_V_RES);
+            draw_host_boxes((uint16_t *)s_preview_buf, BSP_LCD_H_RES, BSP_LCD_V_RES, now_us);
 
             bsp_display_lock(0);
+            char live_ocr[32] = {0};
+            if (s_host_bridge_active) {
+                if (s_host_live_pred[0] != '\0') {
+                    update_live_prediction_label_locked(s_host_live_pred);
+                } else {
+                    update_live_prediction_label_locked(NULL);
+                }
+            } else {
+                char local_meter[32] = {0};
+                bool have_local = false;
+                if (s_ocr_mutex && xSemaphoreTake(s_ocr_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                    if (s_last_meter_reading[0] != '\0') {
+                        strncpy(local_meter, s_last_meter_reading, sizeof(local_meter) - 1);
+                        local_meter[sizeof(local_meter) - 1] = '\0';
+                        have_local = true;
+                    }
+                    xSemaphoreGive(s_ocr_mutex);
+                }
+
+                if (have_local) {
+                    update_live_prediction_label_locked(local_meter);
+                } else if (app_pushlog_ai_get_latest_ocr(live_ocr, sizeof(live_ocr))) {
+                    update_live_prediction_label_locked(live_ocr);
+                } else {
+                    update_live_prediction_label_locked(NULL);
+                }
+            }
             lv_canvas_set_buffer(s_canvas, s_preview_buf, BSP_LCD_H_RES, BSP_LCD_V_RES, PREVIEW_CANVAS_COLOR_FORMAT);
             lv_refr_now(NULL);
             bsp_display_unlock();
@@ -1353,9 +1453,6 @@ static void pushlog_camera_frame_cb(uint8_t *camera_buf,
 
     if (!force_capture && s_web_rgb_buf && s_web_jpeg_buf && s_web_jpeg_mutex) {
         if (now_us < s_web_pause_until_us) {
-            return;
-        }
-        if (s_upload_queue && uxQueueMessagesWaiting(s_upload_queue) > 0) {
             return;
         }
         if ((now_us - s_last_web_frame_us) >= WEB_FRAME_INTERVAL_US) {
@@ -1555,6 +1652,110 @@ esp_err_t app_pushlog_camera_request_upload_now(void)
     s_manual_upload_requested = true;
     s_manual_retry_after_us = 0;
     s_web_pause_until_us = esp_timer_get_time() + 3000000;
+    return ESP_OK;
+}
+
+esp_err_t app_pushlog_camera_set_host_prediction(const char *reading, float score)
+{
+    if (!reading || reading[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char cleaned[32] = {0};
+    size_t n = 0;
+    for (size_t i = 0; reading[i] != '\0' && n < (sizeof(cleaned) - 1); ++i) {
+        char c = reading[i];
+        if (c >= '0' && c <= '9') {
+            cleaned[n++] = c;
+        }
+    }
+    cleaned[n] = '\0';
+    if (n == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Always refresh host display text first; this path must not depend on OCR mutex timing.
+    strncpy(s_host_live_pred, cleaned, sizeof(s_host_live_pred) - 1);
+    s_host_live_pred[sizeof(s_host_live_pred) - 1] = '\0';
+    s_host_live_pred_until_us = esp_timer_get_time() + 60000000;
+    s_host_bridge_active = true;
+
+    if (s_ocr_mutex && xSemaphoreTake(s_ocr_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        strncpy(s_last_ocr_word, cleaned, sizeof(s_last_ocr_word) - 1);
+        s_last_ocr_word[sizeof(s_last_ocr_word) - 1] = '\0';
+
+        strncpy(s_last_meter_reading, cleaned, sizeof(s_last_meter_reading) - 1);
+        s_last_meter_reading[sizeof(s_last_meter_reading) - 1] = '\0';
+
+        s_last_meter_score = (score >= 0.0f) ? score : 0.0f;
+        s_last_ocr_seq++;
+        xSemaphoreGive(s_ocr_mutex);
+    }
+
+    if (s_canvas && bsp_display_lock(0)) {
+        update_live_prediction_label_locked(s_host_live_pred);
+        bsp_display_unlock();
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t app_pushlog_camera_set_host_boxes(const char *boxes_spec)
+{
+    if (!boxes_spec) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (boxes_spec[0] == '\0') {
+        s_host_box_count = 0;
+        s_host_boxes_until_us = 0;
+        s_host_bridge_active = true;
+        return ESP_OK;
+    }
+
+    char local[320] = {0};
+    strncpy(local, boxes_spec, sizeof(local) - 1);
+    local[sizeof(local) - 1] = '\0';
+
+    host_box_t parsed[HOST_BOX_MAX] = {0};
+    size_t count = 0;
+
+    char *save_entry = NULL;
+    for (char *entry = strtok_r(local, "|", &save_entry);
+         entry && count < HOST_BOX_MAX;
+         entry = strtok_r(NULL, "|", &save_entry)) {
+        int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        char lbl[8] = {0};
+        int matched = sscanf(entry, "%d,%d,%d,%d,%7[^,]", &x0, &y0, &x1, &y1, lbl);
+        if (matched < 4) {
+            continue;
+        }
+
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > 100) x1 = 100;
+        if (y1 > 100) y1 = 100;
+        if (x1 <= x0 || y1 <= y0) {
+            continue;
+        }
+
+        parsed[count].x0p = x0;
+        parsed[count].y0p = y0;
+        parsed[count].x1p = x1;
+        parsed[count].y1p = y1;
+        if (matched >= 5) {
+            strncpy(parsed[count].label, lbl, sizeof(parsed[count].label) - 1);
+            parsed[count].label[sizeof(parsed[count].label) - 1] = '\0';
+        }
+        count++;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        s_host_boxes[i] = parsed[i];
+    }
+    s_host_box_count = count;
+    s_host_boxes_until_us = esp_timer_get_time() + 60000000;
+    s_host_bridge_active = true;
     return ESP_OK;
 }
 

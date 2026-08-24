@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
@@ -118,6 +119,74 @@ static esp_err_t ocr_get_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     return httpd_resp_sendstr(req, json);
+}
+
+static esp_err_t host_ocr_post_handler(httpd_req_t *req)
+{
+    char query[192] = {0};
+    esp_err_t ret = httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (ret != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "missing query");
+    }
+
+    char reading[32] = {0};
+    char score_s[24] = {0};
+    if (httpd_query_key_value(query, "reading", reading, sizeof(reading)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "missing reading");
+    }
+    (void)httpd_query_key_value(query, "score", score_s, sizeof(score_s));
+
+    float score = 0.0f;
+    if (score_s[0] != '\0') {
+        score = strtof(score_s, NULL);
+    }
+
+    ret = app_pushlog_camera_set_host_prediction(reading, score);
+    if (ret != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "invalid reading");
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+static esp_err_t host_boxes_post_handler(httpd_req_t *req)
+{
+    char query[640] = {0};
+    esp_err_t ret = httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (ret != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "missing query");
+    }
+
+    char boxes[320] = {0};
+    char reading[32] = {0};
+    char score_s[24] = {0};
+
+    (void)httpd_query_key_value(query, "boxes", boxes, sizeof(boxes));
+    (void)httpd_query_key_value(query, "reading", reading, sizeof(reading));
+    (void)httpd_query_key_value(query, "score", score_s, sizeof(score_s));
+
+    float score = 0.0f;
+    if (score_s[0] != '\0') {
+        score = strtof(score_s, NULL);
+    }
+
+    if (reading[0] != '\0') {
+        (void)app_pushlog_camera_set_host_prediction(reading, score);
+    }
+
+    ret = app_pushlog_camera_set_host_boxes(boxes);
+    if (ret != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "invalid boxes");
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
 static esp_err_t zoom_post_handler(httpd_req_t *req)
@@ -419,11 +488,13 @@ esp_err_t app_pushlog_web_start(void)
     httpd_config_t ctrl_config = HTTPD_DEFAULT_CONFIG();
     ctrl_config.server_port = 80;
     ctrl_config.ctrl_port = 32768;
+    ctrl_config.max_uri_handlers = 16;
 
     httpd_config_t stream_config = HTTPD_DEFAULT_CONFIG();
     stream_config.server_port = 81;
     stream_config.ctrl_port = 32769;
     stream_config.lru_purge_enable = true;
+    stream_config.max_uri_handlers = 8;
 
     esp_err_t ret = httpd_start(&s_ctrl_httpd, &ctrl_config);
     if (ret != ESP_OK) {
@@ -468,6 +539,20 @@ esp_err_t app_pushlog_web_start(void)
         .uri = "/ocr",
         .method = HTTP_GET,
         .handler = ocr_get_handler,
+        .user_ctx = NULL,
+    };
+
+    httpd_uri_t host_ocr_uri = {
+        .uri = "/host_ocr",
+        .method = HTTP_POST,
+        .handler = host_ocr_post_handler,
+        .user_ctx = NULL,
+    };
+
+    httpd_uri_t host_boxes_uri = {
+        .uri = "/host_boxes",
+        .method = HTTP_POST,
+        .handler = host_boxes_post_handler,
         .user_ctx = NULL,
     };
 
@@ -530,6 +615,18 @@ esp_err_t app_pushlog_web_start(void)
         return ret;
     }
 
+    ret = httpd_register_uri_handler(s_ctrl_httpd, &host_ocr_uri);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "register host_ocr handler failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = httpd_register_uri_handler(s_ctrl_httpd, &host_boxes_uri);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "register host_boxes handler failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
     ret = httpd_register_uri_handler(s_ctrl_httpd, &stream_uri);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "register control stream handler failed: %s", esp_err_to_name(ret));
@@ -572,6 +669,6 @@ esp_err_t app_pushlog_web_start(void)
         return ret;
     }
 
-    ESP_LOGI(TAG, "Web UI started: control on :80 (/,/snap,/jpg,/ocr,/zoom,/autofocus,/exposure,/exposure_auto,/stream), stream on :81 (/stream,/jpg)");
+    ESP_LOGI(TAG, "Web UI started: control on :80 (/,/snap,/jpg,/ocr,/host_ocr,/host_boxes,/zoom,/autofocus,/exposure,/exposure_auto,/stream), stream on :81 (/stream,/jpg)");
     return ESP_OK;
 }

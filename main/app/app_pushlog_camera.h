@@ -12,6 +12,8 @@ extern "C" {
 esp_err_t app_pushlog_camera_init(i2c_master_bus_handle_t i2c_handle);
 esp_err_t app_pushlog_camera_request_upload_now(void);
 esp_err_t app_pushlog_camera_get_web_jpeg(uint8_t *out_buf, size_t out_buf_size, size_t *out_size);
+esp_err_t app_pushlog_camera_set_host_prediction(const char *reading, float score);
+esp_err_t app_pushlog_camera_set_host_boxes(const char *boxes_spec);
 bool app_pushlog_camera_get_last_meter_reading(char *out_reading, size_t out_size, float *score);
 bool app_pushlog_camera_get_last_meter_snapshot(char *out_reading, size_t out_size, float *score, uint32_t *seq);
 bool app_pushlog_camera_get_last_ocr_snapshot(char *out_word,
